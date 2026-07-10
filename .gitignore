@@ -5,3 +5,4 @@ __pycache__/
 .superpowers/
 *.sparseimage
 blackbox/__pycache__/
+/target
