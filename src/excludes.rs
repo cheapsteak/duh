@@ -1,4 +1,4 @@
-//! Exclude rules, ported from the Python oracle at `./duh:198-255`.
+//! Exclude rules, ported from the Python oracle at `reference/duh-py:198-255`.
 //!
 //! Two families of default excludes:
 //! - Single-name excludes match a directory entry's basename (`name`).
@@ -7,7 +7,7 @@
 //!   check. e.g. `.git/objects` matches `a/.git/objects` and `.git/objects`
 //!   but not `notgit/objects` — yet it DOES match `x.git/objects`, an
 //!   intentional false positive inherited from the Python oracle's
-//!   `is_excluded` (`./duh:246-255`). Do NOT "harden" this with boundary
+//!   `is_excluded` (`reference/duh-py:246-255`). Do NOT "harden" this with boundary
 //!   logic: scan parity with the Python implementation depends on
 //!   replicating this quirk exactly.
 //!
@@ -152,7 +152,7 @@ mod tests {
     /// Pin the oracle's bare-suffix quirk: the multi-component check is a
     /// raw `ends_with` with NO component-boundary guard, so a rel_path like
     /// `x.git/objects` (directory literally named "x.git") DOES match the
-    /// `.git/objects` pattern. The Python oracle (`./duh:246-255`) behaves
+    /// `.git/objects` pattern. The Python oracle (`reference/duh-py:246-255`) behaves
     /// identically. This false positive is intentional — if a future change
     /// "fixes" it with boundary logic, this test must fail and force the
     /// Python-parity conversation.

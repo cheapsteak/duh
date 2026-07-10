@@ -1,12 +1,12 @@
 //! macOS `getattrlistbulk` / `getattrlist` FFI with APFS clone-ID detection.
 //!
-//! Ports the proven ctypes binding from the Python oracle (`./duh:47-115`) and
+//! Ports the proven ctypes binding from the Python oracle (`reference/duh-py:47-115`) and
 //! extends it with a bulk directory reader for the scanner (Task 9).
 //!
 //! Constants are verified against the current macOS SDK headers:
 //!   /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/{attr,vnode}.h
 //! (header line numbers noted inline). `ATTR_CMNEXT_CLONEID = 0x100` matches both
-//! the header (attr.h:558) and the oracle's empirical note (`./duh:49`).
+//! the header (attr.h:558) and the oracle's empirical note (`reference/duh-py:49`).
 
 use std::ffi::{CString, OsString};
 use std::os::unix::ffi::OsStringExt;
@@ -49,7 +49,7 @@ const ATTR_FILE_LINKCOUNT: u32 = 0x0000_0001; // attr.h:532
 const ATTR_FILE_TOTALSIZE: u32 = 0x0000_0002; // attr.h:533
 const ATTR_FILE_ALLOCSIZE: u32 = 0x0000_0004; // attr.h:534
 
-const ATTR_CMNEXT_CLONEID: u32 = 0x0000_0100; // attr.h:558 (== oracle empirical, ./duh:49)
+const ATTR_CMNEXT_CLONEID: u32 = 0x0000_0100; // attr.h:558 (== oracle empirical, reference/duh-py:49)
 
 const FSOPT_NOFOLLOW: u32 = 0x0000_0001; // attr.h:46
 const FSOPT_PACK_INVAL_ATTRS: u32 = 0x0000_0008; // attr.h:50
@@ -208,7 +208,7 @@ fn parse_record(rec: &[u8], dir: &Path) -> Option<EntryAttrs> {
 
     // Clone id: the kernel returns a forkattr CLONEID for every object (a dir's is
     // just its own id), but the Python oracle only records clone_ids for regular
-    // files (./duh:463-468) — match that parity so clone-family logic (Task 9)
+    // files (reference/duh-py:463-468) — match that parity so clone-family logic (Task 9)
     // sees exactly what the reference does. Still consume the field to keep the
     // cursor aligned when present.
     let raw_clone = if (ret_fork & ATTR_CMNEXT_CLONEID) != 0 {
@@ -299,7 +299,7 @@ pub fn read_dir_attrs(dir: &Path) -> std::io::Result<Vec<EntryAttrs>> {
 }
 
 /// Return the APFS clone ID for `path`, or `None` if unavailable/unsupported.
-/// Direct port of the oracle's single-path `getattrlist` binding (`./duh:74-115`).
+/// Direct port of the oracle's single-path `getattrlist` binding (`reference/duh-py:74-115`).
 pub fn get_clone_id(path: &Path) -> Option<u64> {
     let cpath = CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
 

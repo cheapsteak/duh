@@ -4,7 +4,7 @@
 oracle and the Rust binary. The remaining tests exercise Rust-only behaviour
 (embedded static assets, the Host-header / DNS-rebinding guard) and are skipped
 when DUH_BIN is the frozen Python oracle. The Rust release binary lives under
-`target/`, the oracle at the repo root, so path membership discriminates them.
+`target/`, the oracle at `reference/duh-py`, so path membership discriminates them.
 """
 import json
 import socket

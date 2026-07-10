@@ -1,5 +1,5 @@
 //! `duh serve` — local web UI HTTP server (port of the Python `_DuhHandler`
-//! and `cmd_serve`, `./duh:2118-3018`).
+//! and `cmd_serve`, `reference/duh-py:2118-3018`).
 //!
 //! Startup order mirrors the oracle: build directory aggregates (`_build_dir_agg`),
 //! compute the freeable/locked maps, seed a path cache, then bind a threaded
@@ -33,7 +33,7 @@ static ECHARTS_JS: &[u8] = include_bytes!("../static/vendor/echarts.min.js");
 
 const NUM_THREADS: usize = 4;
 
-/// Per-directory subtree aggregate (port of a `dir_agg` entry, `./duh:2128-2238`).
+/// Per-directory subtree aggregate (port of a `dir_agg` entry, `reference/duh-py:2128-2238`).
 #[derive(Clone, Copy, Default)]
 struct Agg {
     total_blocks: i64,
@@ -47,7 +47,7 @@ struct State {
     dir_agg: HashMap<i64, Agg>,
     freeable_map: HashMap<i64, u64>,
     locked_here_map: HashMap<i64, u64>,
-    /// Memoized id -> full path (port of `_PathCache`, `./duh:2242-2267`).
+    /// Memoized id -> full path (port of `_PathCache`, `reference/duh-py:2242-2267`).
     path_cache: Mutex<HashMap<i64, String>>,
 }
 
@@ -89,7 +89,7 @@ pub fn run(db_path: &Path, port: u16, no_browser: bool) -> ExitCode {
         path_cache: Mutex::new(HashMap::new()),
     });
 
-    // Bind, trying up to port+10 (port range fallback, `./duh:2988-2997`).
+    // Bind, trying up to port+10 (port range fallback, `reference/duh-py:2988-2997`).
     let max_port = port.saturating_add(10);
     let mut server = None;
     let mut bound_port = port;
@@ -180,7 +180,7 @@ fn worker(server: &Server, state: &State) {
 
 /// Open a per-thread connection: read-only at the file level, plus PRAGMA
 /// query_only and a large page cache, mirroring the oracle's per-thread
-/// connections (`./duh:2795-2805`).
+/// connections (`reference/duh-py:2795-2805`).
 fn open_thread_con(db_path: &Path) -> rusqlite::Result<Connection> {
     let con = Connection::open_with_flags(
         db_path,
@@ -295,7 +295,7 @@ fn api_root(con: &Connection) -> ApiResult {
     Ok(Ok(json!({"id": id, "path": root_path, "name": root_path})))
 }
 
-/// `GET /api/node/{id}` — node info + immediate children (`./duh:2860-2929`).
+/// `GET /api/node/{id}` — node info + immediate children (`reference/duh-py:2860-2929`).
 fn api_node(con: &Connection, state: &State, node_id: i64) -> ApiResult {
     let node = con
         .query_row(
@@ -382,7 +382,7 @@ fn api_node(con: &Connection, state: &State, node_id: i64) -> ApiResult {
         });
     }
 
-    // Stable sort by freeable desc, limit 200 (`./duh:2926-2927`). Stability
+    // Stable sort by freeable desc, limit 200 (`reference/duh-py:2926-2927`). Stability
     // keeps the DB order for ties, matching Python's stable sort.
     children.sort_by(|a, b| b.freeable.cmp(&a.freeable));
     children.truncate(200);
@@ -407,7 +407,7 @@ fn api_node(con: &Connection, state: &State, node_id: i64) -> ApiResult {
     Ok(Ok(json!({"node": node_info, "children": children_json})))
 }
 
-/// `GET /api/marginal/{id}` — marginal freeable for a subtree (`./duh:2931-2938`).
+/// `GET /api/marginal/{id}` — marginal freeable for a subtree (`reference/duh-py:2931-2938`).
 fn api_marginal(con: &Connection, node_id: i64) -> ApiResult {
     let exists: Option<i64> =
         con.query_row("SELECT id FROM files WHERE id = ?", [node_id], |r| r.get(0)).ok();
@@ -426,7 +426,7 @@ fn api_marginal(con: &Connection, node_id: i64) -> ApiResult {
     })))
 }
 
-/// `GET /api/breadcrumb/{id}` — root-first chain of `{id, name}` (`./duh:2940-2953`).
+/// `GET /api/breadcrumb/{id}` — root-first chain of `{id, name}` (`reference/duh-py:2940-2953`).
 fn api_breadcrumb(con: &Connection, node_id: i64) -> ApiResult {
     let mut stmt = con.prepare(
         "WITH RECURSIVE chain(id, parent_id, name) AS ( \
@@ -460,7 +460,7 @@ fn path_for(con: &Connection, state: &State, id: i64) -> rusqlite::Result<String
     Ok(path)
 }
 
-// --- directory aggregates (port of `_build_dir_agg`, `./duh:2128-2238`) -------
+// --- directory aggregates (port of `_build_dir_agg`, `reference/duh-py:2128-2238`) -------
 
 /// A single `files` row, loaded once for the bottom-up aggregation pass.
 struct AggRow {
@@ -475,7 +475,7 @@ struct AggRow {
 
 /// Walk the DB bottom-up and build `dir_agg[id]` for every directory. Excluded
 /// subtree rows are treated as pre-summed leaves. Faithful port of the oracle's
-/// iterative post-order DFS (`./duh:2168-2234`).
+/// iterative post-order DFS (`reference/duh-py:2168-2234`).
 fn build_dir_agg(con: &Connection) -> rusqlite::Result<HashMap<i64, Agg>> {
     let t0 = Instant::now();
     eprintln!("[serve] pre-computing directory aggregates...");

@@ -5,7 +5,7 @@ from conftest import REPO
 
 
 def test_rust_scan_matches_python_scan(fixture_tree, tmp_path):
-    py_bin = REPO / "duh"           # after Task 16: REPO / "reference/duh-py"
+    py_bin = REPO / "reference/duh-py"
     rs_bin = REPO / "target/release/duh"
     if not rs_bin.exists():
         import pytest; pytest.skip("rust binary not built")
@@ -31,7 +31,7 @@ def _path_of(con, node_id):
 def test_freeable_cache_exact_parity(fixture_tree, tmp_path):
     """Both implementations, same tree: freeable_cache identical by path."""
     import sqlite3
-    py_bin, rs_bin = REPO / "duh", REPO / "target/release/duh"
+    py_bin, rs_bin = REPO / "reference/duh-py", REPO / "target/release/duh"
     if not rs_bin.exists():
         import pytest; pytest.skip("rust binary not built")
     results = {}

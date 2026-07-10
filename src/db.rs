@@ -1,8 +1,8 @@
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
-/// Verbatim from reference `./duh` lines 295-341 (`_init_schema`'s `executescript` block)
-/// plus the `freeable_cache` table DDL from `./duh` lines 1617-1623
+/// Verbatim from the reference oracle `reference/duh-py` lines 295-341 (`_init_schema`'s `executescript` block)
+/// plus the `freeable_cache` table DDL from `reference/duh-py` lines 1617-1623
 /// (`_persist_freeable_cache`'s `executescript` block). Do not "improve" this SQL.
 pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS scans (

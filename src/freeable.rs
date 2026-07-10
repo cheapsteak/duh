@@ -1,6 +1,6 @@
-//! Port of the reference `./duh` freeable engine: `compute_freeable`
-//! (`./duh:1654-2116`) plus the `freeable`, `marginal`, and `file` subcommands
-//! (`./duh:3076-3092`, `./duh:1084-1217`, `./duh:1223-1272`).
+//! Port of the reference oracle `reference/duh-py` freeable engine: `compute_freeable`
+//! (`reference/duh-py:1654-2116`) plus the `freeable`, `marginal`, and `file` subcommands
+//! (`reference/duh-py:3076-3092`, `reference/duh-py:1084-1217`, `reference/duh-py:1223-1272`).
 //!
 //! The intellectual core is [`compute`], which mirrors `compute_freeable`
 //! phase-for-phase. The Python uses dense `array.array` structures indexed by
@@ -38,7 +38,7 @@ impl ToSql for RawText<'_> {
 
 // ---------------------------------------------------------------------------
 // Dense-array LCA helpers (ports of `_lca_arr` / `_direct_child_of_arr`,
-// `./duh:1529-1567`).
+// `reference/duh-py:1529-1567`).
 // ---------------------------------------------------------------------------
 
 /// Compute the LCA of two nodes using dense arrays. Returns -1 if no common
@@ -97,7 +97,7 @@ fn direct_child_of_arr(ancestor: i64, descendant: i64, parent: &[i64]) -> i64 {
 
 // ---------------------------------------------------------------------------
 // Cache (ports of `_get_latest_scan_id`, `_load_freeable_cache`,
-// `_persist_freeable_cache`, `./duh:1570-1651`).
+// `_persist_freeable_cache`, `reference/duh-py:1570-1651`).
 // ---------------------------------------------------------------------------
 
 fn get_latest_scan_id(con: &Connection) -> rusqlite::Result<Option<i64>> {
@@ -169,7 +169,7 @@ fn persist_cache(
 }
 
 // ---------------------------------------------------------------------------
-// compute_freeable (`./duh:1654-2116`)
+// compute_freeable (`reference/duh-py:1654-2116`)
 // ---------------------------------------------------------------------------
 
 /// A pending locked-here contribution: (lca_node, credit_blocks, child_set).
@@ -576,7 +576,7 @@ fn finalize_family<I: Iterator<Item = i64>>(
 }
 
 // ---------------------------------------------------------------------------
-// Path helpers (ports of `resolve_path_to_id` / `full_path`, `./duh:348-418`).
+// Path helpers (ports of `resolve_path_to_id` / `full_path`, `reference/duh-py:348-418`).
 // ---------------------------------------------------------------------------
 
 /// Walk path components top-down to find the node_id, or `None` if not indexed.
@@ -667,7 +667,7 @@ pub(crate) fn full_path(con: &Connection, file_id: i64) -> rusqlite::Result<Stri
 }
 
 // ---------------------------------------------------------------------------
-// Formatting helpers (ports of `fmt_bytes`, `./duh:175-181`, plus Python's
+// Formatting helpers (ports of `fmt_bytes`, `reference/duh-py:175-181`, plus Python's
 // thousands grouping and `time.ctime`).
 // ---------------------------------------------------------------------------
 
@@ -724,7 +724,7 @@ pub(crate) fn ctime(secs: i64) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// FREEABLE subcommand (`./duh:3076-3092`)
+// FREEABLE subcommand (`reference/duh-py:3076-3092`)
 // ---------------------------------------------------------------------------
 
 pub fn cmd_freeable(con: &Connection, path: &str, json: bool) -> rusqlite::Result<ExitCode> {
@@ -760,8 +760,8 @@ pub fn cmd_freeable(con: &Connection, path: &str, json: bool) -> rusqlite::Resul
 }
 
 // ---------------------------------------------------------------------------
-// MARGINAL subcommand (`./duh:1084-1217`, `_compute_marginal_freeable`
-// `./duh:972-1078`)
+// MARGINAL subcommand (`reference/duh-py:1084-1217`, `_compute_marginal_freeable`
+// `reference/duh-py:972-1078`)
 // ---------------------------------------------------------------------------
 
 pub(crate) struct MarginalResult {
@@ -941,7 +941,7 @@ struct LeakCand {
     ino: i64,
 }
 
-/// Port of the external-leaks section of `cmd_marginal` (`./duh:1100-1217`):
+/// Port of the external-leaks section of `cmd_marginal` (`reference/duh-py:1100-1217`):
 /// families (clone or hardlink) with members outside the target get an
 /// approximate outside-blocks figure, top 5 printed. The reference computes
 /// this even in `--json` mode but never includes it in the JSON output, so the
@@ -1144,7 +1144,7 @@ struct OrderedMarginal {
 }
 
 // ---------------------------------------------------------------------------
-// FILE subcommand (`./duh:1223-1272`)
+// FILE subcommand (`reference/duh-py:1223-1272`)
 // ---------------------------------------------------------------------------
 
 pub fn cmd_file(con: &Connection, path: &str) -> rusqlite::Result<ExitCode> {

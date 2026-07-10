@@ -212,7 +212,7 @@ where
     }
 }
 
-/// Port of the Python oracle's `cmd_selftest` (`./duh:121-169`): create a 1 MiB
+/// Port of the Python oracle's `cmd_selftest` (`reference/duh-py:121-169`): create a 1 MiB
 /// random file under `~/tmp-duh-selftest/run-<millis>`, `cp -c` clone it, byte-copy
 /// it, then confirm the clone shares the source's clone_id while the copy does not.
 fn run_selftest() -> ExitCode {

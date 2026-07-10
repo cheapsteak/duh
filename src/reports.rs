@@ -1,7 +1,7 @@
-//! Port of the reference `./duh` report subcommands: `top` (`./duh:840-967`),
-//! `clones` (`./duh:1278-1352`), `excluded` (`./duh:1357-1392`), `sql` +
-//! `_VIEWS_SQL` (`./duh:1397-1445`), `stats` (`./duh:1450-1523`), and
-//! `clusters` (`./duh:3023-3072`).
+//! Port of the reference oracle `reference/duh-py` report subcommands: `top` (`reference/duh-py:840-967`),
+//! `clones` (`reference/duh-py:1278-1352`), `excluded` (`reference/duh-py:1357-1392`), `sql` +
+//! `_VIEWS_SQL` (`reference/duh-py:1397-1445`), `stats` (`reference/duh-py:1450-1523`), and
+//! `clusters` (`reference/duh-py:3023-3072`).
 //!
 //! Every SQL string below is copied verbatim from the reference — it is the
 //! spec. Where the reference already emits `--json` (top, clones, clusters)
@@ -14,7 +14,7 @@
 //! `excluded --json` and `freeable --json` (the latter lives in
 //! `freeable.rs`) have no reference counterpart — the reference's argparse
 //! setup never adds `--json` to those two subcommands (confirmed against
-//! `./duh:3149-3151` and `:3159-3161`). Those two schemas are additive Rust
+//! `reference/duh-py:3149-3151` and `:3159-3161`). Those two schemas are additive Rust
 //! choices, kept consistent with each command's own text-report columns.
 
 use std::collections::HashMap;
@@ -26,7 +26,7 @@ use rusqlite::{named_params, Connection, OptionalExtension};
 use crate::freeable::{commafy, compute as compute_freeable, ctime, fmt_bytes, full_path, resolve_path_to_id, DESC_CTE};
 use crate::scan::realpath;
 
-/// Port of `col_width` (`./duh:191-193`).
+/// Port of `col_width` (`reference/duh-py:191-193`).
 fn col_width(items: &[String], header: &str) -> usize {
     if items.is_empty() {
         header.chars().count()
@@ -40,7 +40,7 @@ fn col_width(items: &[String], header: &str) -> usize {
     }
 }
 
-/// Port of `fmt_bytes_highlight` (`./duh:184-189`).
+/// Port of `fmt_bytes_highlight` (`reference/duh-py:184-189`).
 fn fmt_bytes_highlight(real: i64, apparent: i64) -> String {
     let s = fmt_bytes(apparent);
     if real > 0 && ((apparent - real).abs() as f64 / real as f64) > 0.05 {
@@ -75,10 +75,10 @@ fn shorten<'a>(home: &str, p: &'a str) -> std::borrow::Cow<'a, str> {
 }
 
 // ---------------------------------------------------------------------------
-// TOP (`./duh:840-967`)
+// TOP (`reference/duh-py:840-967`)
 // ---------------------------------------------------------------------------
 
-/// The recursive-CTE query, copied verbatim from `./duh:872-915`.
+/// The recursive-CTE query, copied verbatim from `reference/duh-py:872-915`.
 const TOP_SQL: &str = "
     WITH RECURSIVE
     tree(id, is_dir, is_excluded, size_blocks, size_logical, clone_id,
@@ -239,7 +239,7 @@ pub fn cmd_top(
 }
 
 // ---------------------------------------------------------------------------
-// CLONES (`./duh:1278-1352`)
+// CLONES (`reference/duh-py:1278-1352`)
 // ---------------------------------------------------------------------------
 
 pub fn cmd_clones(
@@ -366,11 +366,11 @@ pub fn cmd_clones(
 }
 
 // ---------------------------------------------------------------------------
-// EXCLUDED (`./duh:1357-1392`)
+// EXCLUDED (`reference/duh-py:1357-1392`)
 // ---------------------------------------------------------------------------
 
 /// `--json` is a Rust-only addition (the reference `excluded` parser has no
-/// `--json`, `./duh:3149-3151`). Keys mirror the text table's RANK/BLOCKS/
+/// `--json`, `reference/duh-py:3149-3151`). Keys mirror the text table's RANK/BLOCKS/
 /// FILES/PATH columns plus `size_logical`, which the SQL selects but the text
 /// report never prints.
 pub fn cmd_excluded(con: &Connection, limit: i64, json: bool) -> rusqlite::Result<ExitCode> {
@@ -445,7 +445,7 @@ pub fn cmd_excluded(con: &Connection, limit: i64, json: bool) -> rusqlite::Resul
 }
 
 // ---------------------------------------------------------------------------
-// CLUSTERS (`./duh:3023-3072`)
+// CLUSTERS (`reference/duh-py:3023-3072`)
 // ---------------------------------------------------------------------------
 
 pub fn cmd_clusters(
@@ -528,10 +528,10 @@ pub fn cmd_clusters(
 }
 
 // ---------------------------------------------------------------------------
-// SQL (`./duh:1397-1445`)
+// SQL (`reference/duh-py:1397-1445`)
 // ---------------------------------------------------------------------------
 
-/// Verbatim from `./duh:1397-1429` (`_VIEWS_SQL`). Do not "improve" this SQL.
+/// Verbatim from `reference/duh-py:1397-1429` (`_VIEWS_SQL`). Do not "improve" this SQL.
 const VIEWS_SQL: &str = "
 CREATE TEMP VIEW IF NOT EXISTS v_dir_real AS
   SELECT f.parent_id,
@@ -565,7 +565,7 @@ CREATE TEMP VIEW IF NOT EXISTS v_excluded AS
   ORDER BY size_blocks DESC;
 ";
 
-/// Port of `cmd_sql` (`./duh:1431-1444`). Unlike every other report command,
+/// Port of `cmd_sql` (`reference/duh-py:1431-1444`). Unlike every other report command,
 /// this one operates on the raw DB path rather than an open `Connection` —
 /// the reference checks `os.path.exists` (no implicit schema creation) and
 /// then hands the whole terminal over to `sqlite3 -init <views> <db>`.
@@ -602,7 +602,7 @@ pub fn cmd_sql(db_path: &Path) -> ExitCode {
 }
 
 // ---------------------------------------------------------------------------
-// STATS (`./duh:1450-1523`)
+// STATS (`reference/duh-py:1450-1523`)
 // ---------------------------------------------------------------------------
 
 pub fn cmd_stats(con: &Connection) -> rusqlite::Result<ExitCode> {

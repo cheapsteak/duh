@@ -24,11 +24,10 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install pytest || python3 -m pip install --user --break-system-packages pytest
 
-      # NOTE (Task 16 coupling): the python oracle currently lives at repo
-      # root ./duh. Task 16 moves it to reference/ and updates
-      # blackbox/test_db_parity.py's py_bin path accordingly. Nothing here
-      # references the oracle path directly (DUH_BIN only points at the rust
-      # binary), so this workflow needs no change when that move happens.
+      # The python oracle lives at reference/duh-py; the rust binary is duh.
+      # DUH_BIN only ever points at the rust binary here, and the parity step
+      # resolves both binaries internally (blackbox/test_db_parity.py), so no
+      # step references the oracle path directly.
       - name: black-box suite vs rust
         run: DUH_BIN=$PWD/target/release/duh python3 -m pytest blackbox/ -q
 

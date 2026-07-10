@@ -11,7 +11,7 @@ import pytest
 
 MiB = 1 << 20
 REPO = pathlib.Path(__file__).resolve().parent.parent
-DUH_BIN = pathlib.Path(os.environ.get("DUH_BIN", REPO / "duh"))
+DUH_BIN = pathlib.Path(os.environ.get("DUH_BIN", REPO / "target/release/duh"))
 
 
 def run_duh(*argv, db, check=True, timeout=300):

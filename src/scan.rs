@@ -1,6 +1,6 @@
 //! Parallel scanner — a faithful port of the Python oracle's `cmd_scan`
-//! (`./duh:540-837`), `walk_for_aggregate` (`./duh:436-484`), and the batch/insert
-//! SQL (`./duh:489-537`), restructured into N worker threads + one writer thread
+//! (`reference/duh-py:540-837`), `walk_for_aggregate` (`reference/duh-py:436-484`), and the batch/insert
+//! SQL (`reference/duh-py:489-537`), restructured into N worker threads + one writer thread
 //! (Task 10). The single-threaded control flow it replaces was itself a
 //! line-for-line port; each entry is still classified the same way.
 //!
@@ -75,7 +75,7 @@ pub struct ScanArgs {
 }
 
 /// SIGINT flag. Set by the async-signal handler, polled per directory / per entry
-/// exactly like the Python `interrupted` nonlocal (`./duh:621-625`).
+/// exactly like the Python `interrupted` nonlocal (`reference/duh-py:621-625`).
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_sigint(_sig: libc::c_int) {
@@ -98,7 +98,7 @@ impl ToSql for RawText<'_> {
 
 /// Column list shared by file and dir inserts, with an explicit `id` (see module
 /// docs). `OR IGNORE` mirrors `_INSERT_FILE_SQL` / `_INSERT_DIR_SQL`
-/// (`./duh:493-506`), which lean on the `UNIQUE(parent_id, name)` constraint.
+/// (`reference/duh-py:493-506`), which lean on the `UNIQUE(parent_id, name)` constraint.
 const INSERT_SQL: &str = "\
 INSERT OR IGNORE INTO files
   (id, parent_id, name, is_dir, is_symlink, is_excluded, dev, ino, clone_id,
@@ -113,7 +113,7 @@ fn now_secs() -> f64 {
 }
 
 /// Free GiB on the volume containing `path` (`os.statvfs` → `f_bavail*f_frsize`,
-/// `./duh:264-271`). Returns +inf on error so the disk guard fails open, matching
+/// `reference/duh-py:264-271`). Returns +inf on error so the disk guard fails open, matching
 /// the Python `except OSError: return float("inf")`.
 fn free_gib(path: &Path) -> f64 {
     let cpath = match CString::new(path.as_os_str().as_bytes()) {
@@ -128,7 +128,7 @@ fn free_gib(path: &Path) -> f64 {
 }
 
 /// Python `{n:,}` equivalent: thousands separators for the file counts in the
-/// stderr progress / interrupt / completion lines (`./duh:780,822,829` — only
+/// stderr progress / interrupt / completion lines (`reference/duh-py:780,822,829` — only
 /// the file counts get separators there; excluded counts do not).
 fn fmt_thousands(n: i64) -> String {
     let (sign, mut digits) = if n < 0 {
@@ -144,7 +144,7 @@ fn fmt_thousands(n: i64) -> String {
     format!("{sign}{digits}")
 }
 
-/// IEC byte formatting, ported from `fmt_bytes` (`./duh:175-181`). Used only for
+/// IEC byte formatting, ported from `fmt_bytes` (`reference/duh-py:175-181`). Used only for
 /// stderr progress / completion lines.
 fn fmt_bytes(n: i64) -> String {
     if n < 0 {
@@ -194,14 +194,14 @@ pub(crate) fn realpath(p: &Path) -> PathBuf {
 /// Per-clone-family accumulator for an excluded subtree: [count, blocks_sum, max_blocks].
 type Family = (i64, i64, i64);
 
-/// Port of `walk_for_aggregate` (`./duh:436-484`). Walks `dir_path` WITHOUT
+/// Port of `walk_for_aggregate` (`reference/duh-py:436-484`). Walks `dir_path` WITHOUT
 /// inserting rows and returns `(blocks, logical, count, clone_families)` where
 /// each family maps `clone_id -> (member_count, blocks_sum, max_blocks)`.
 ///
 /// Note: like the reference, this ALWAYS collects clone families — it takes no
 /// `--no-clones` flag, so excluded_families are populated even under `--no-clones`
-/// (`./duh:698` calls it unconditionally). Only regular files carry a clone_id
-/// (EntryAttrs sets it for VREG only, matching `./duh:463-468`).
+/// (`reference/duh-py:698` calls it unconditionally). Only regular files carry a clone_id
+/// (EntryAttrs sets it for VREG only, matching `reference/duh-py:463-468`).
 fn walk_for_aggregate(dir_path: &Path, root_dev: i32) -> (i64, i64, i64, HashMap<u64, Family>) {
     let mut total_blocks: i64 = 0;
     let mut total_logical: i64 = 0;
@@ -210,7 +210,7 @@ fn walk_for_aggregate(dir_path: &Path, root_dev: i32) -> (i64, i64, i64, HashMap
 
     let mut stack: Vec<PathBuf> = vec![dir_path.to_path_buf()];
     while let Some(d) = stack.pop() {
-        // PermissionError / OSError on scandir → skip silently (./duh:448-451).
+        // PermissionError / OSError on scandir → skip silently (reference/duh-py:448-451).
         let entries = match attrs::read_dir_attrs(&d) {
             Ok(e) => e,
             Err(_) => continue,
@@ -486,7 +486,7 @@ fn worker(
             let is_dir = entry.is_dir;
             let is_symlink = entry.is_symlink;
 
-            // Exclusion check (dirs only), BEFORE clone-id collection (./duh:694-724).
+            // Exclusion check (dirs only), BEFORE clone-id collection (reference/duh-py:694-724).
             if is_dir && !is_symlink && excludes.matches(&name_str, &entry_rel) {
                 let (agg_blocks, agg_logical, agg_count, families) =
                     walk_for_aggregate(&entry_path, root_dev);
@@ -517,7 +517,7 @@ fn worker(
             }
 
             // clone_id for every non-symlink entry (files AND dirs) unless
-            // --no-clones (./duh:726-731). Directories need the extra syscall (the
+            // --no-clones (reference/duh-py:726-731). Directories need the extra syscall (the
             // bulk reader gates clone_id to VREG); regular files reuse the id the
             // bulk reader already extracted.
             let clone_id = if no_clones || is_symlink {
@@ -703,7 +703,7 @@ fn writer(
         ],
     )?;
 
-    // Invalidate the freeable cache (./duh:808-816). The table always exists here.
+    // Invalidate the freeable cache (reference/duh-py:808-816). The table always exists here.
     con.execute("DELETE FROM freeable_cache", [])?;
     eprintln!("[scan] freeable cache invalidated");
     Ok(())
@@ -711,7 +711,7 @@ fn writer(
 
 /// Entry point for the `scan` subcommand. Returns the process exit code.
 pub fn run(args: ScanArgs, db_path: &Path) -> ExitCode {
-    // realpath + existence check BEFORE touching the DB (./duh:541-543), so a bad
+    // realpath + existence check BEFORE touching the DB (reference/duh-py:541-543), so a bad
     // path never creates a database file.
     let root = realpath(Path::new(&args.path));
     if std::fs::metadata(&root).is_err() {
@@ -745,7 +745,7 @@ fn run_inner(
     let root_bytes = root.as_os_str().as_bytes();
 
     // --rescan: delete prior rows for this root. excluded_families BEFORE files
-    // (FK), then files, then the scans row (./duh:550-565).
+    // (FK), then files, then the scans row (reference/duh-py:550-565).
     if args.rescan {
         let old_ids: Vec<i64> = {
             let mut stmt = con.prepare("SELECT id FROM scans WHERE root = ?")?;
@@ -775,7 +775,7 @@ fn run_inner(
     )?;
     let scan_id = con.last_insert_rowid();
 
-    // Free-space precheck, measured on the DB's directory (./duh:576-591).
+    // Free-space precheck, measured on the DB's directory (reference/duh-py:576-591).
     let db_dir = db_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -819,7 +819,7 @@ fn run_inner(
 
     // Insert the root dir on this setup thread, before the connection moves to the
     // writer. Its name is the FULL realpath; clone_id comes from get_clone_id(root)
-    // regardless of it being a directory (./duh:628-650) — this is why we do NOT
+    // regardless of it being a directory (reference/duh-py:628-650) — this is why we do NOT
     // reuse root_stat.clone_id (which is None for dirs).
     let root_clone = if args.no_clones {
         None
@@ -951,7 +951,7 @@ fn run_inner(
 mod tests {
     use super::fmt_thousands;
 
-    /// Pin parity with Python's `{n:,}` formatting (used at ./duh:780,822,829).
+    /// Pin parity with Python's `{n:,}` formatting (used at reference/duh-py:780,822,829).
     #[test]
     fn fmt_thousands_matches_python_comma_format() {
         assert_eq!(fmt_thousands(0), "0");
