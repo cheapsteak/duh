@@ -1,26 +1,54 @@
-//! Single-threaded scanner — a faithful port of the Python oracle's `cmd_scan`
+//! Parallel scanner — a faithful port of the Python oracle's `cmd_scan`
 //! (`./duh:540-837`), `walk_for_aggregate` (`./duh:436-484`), and the batch/insert
-//! SQL (`./duh:489-537`).
+//! SQL (`./duh:489-537`), restructured into N worker threads + one writer thread
+//! (Task 10). The single-threaded control flow it replaces was itself a
+//! line-for-line port; each entry is still classified the same way.
 //!
 //! Parity target: the databases written here must be identical in *content*
-//! (compared by path, not by row id) to the Python scanner. Control flow mirrors
-//! the reference line-for-line; deviations are documented in the task report.
+//! (compared by path, not by row id) to the Python scanner. Deviations are
+//! documented in the task report.
+//!
+//! Threading model:
+//!   - The **writer** thread owns the rusqlite `Connection` and is the *only*
+//!     thread that touches the DB during the scan body. It receives `Msg` batches
+//!     over a `crossbeam_channel::bounded(64)`, groups ~`BATCH_SIZE` rows per
+//!     transaction, and hosts the 5s progress line, the 10s disk guard, and SIGINT
+//!     translation (it has natural access to the running counters).
+//!   - **Worker** threads share a `Coord` work queue of `(parent_id, PathBuf,
+//!     rel_path)` items. Each pops a directory, reads its entries, and for every
+//!     child preassigns an id and emits a row; subdirectories are pushed back onto
+//!     the queue. Excluded-subtree aggregation (`walk_for_aggregate`) and the
+//!     per-directory clone-id syscall run in whichever worker hit them.
 //!
 //! IDs: unlike Python (which relies on SQLite autoincrement / `lastrowid`), we
-//! allocate ids from an explicit monotonic `next_id` counter seeded from
-//! `SELECT COALESCE(MAX(id),0) FROM files`, and insert with an explicit `id`.
-//! Task 10's parallel scanner depends on this pattern (workers can preassign ids
-//! without a writer round-trip). Content is unaffected because the acceptance
-//! suite compares by path.
+//! allocate ids from an explicit monotonic `AtomicI64` counter seeded from
+//! `SELECT COALESCE(MAX(id),0) FROM files`, and insert with an explicit `id`. This
+//! is what lets a worker reference a child's `parent_id` before the parent row has
+//! been written: a directory row is always *sent* before that directory is pushed
+//! onto the work queue, so no worker ever emits a child of an unsent parent.
+//! Content is unaffected because the acceptance suite compares by path.
+//!
+//! FK / ordering note: the writer disables `foreign_keys` for the scan body. The
+//! `UNIQUE(parent_id, name)` constraint can never fire within one scan (a
+//! directory cannot hold two entries of the same name, and roots have a NULL,
+//! distinct-under-UNIQUE parent), so `INSERT OR IGNORE` never resolves a conflict
+//! and every preassigned id is used verbatim — insert *order* is therefore
+//! irrelevant to row content. Disabling FK enforcement removes the only remaining
+//! ordering hazard (a child batch reaching the DB before its parent's row), which
+//! is otherwise merely a matter of cross-thread arrival order. Referential
+//! integrity is still guaranteed structurally (every emitted child's parent row is
+//! emitted first) and is checked by the parity harness' path reconstruction.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crossbeam_channel::{bounded, RecvTimeoutError, Sender};
 use rusqlite::types::{ToSqlOutput, ValueRef};
 use rusqlite::{Connection, ToSql};
 
@@ -212,61 +240,7 @@ fn walk_for_aggregate(dir_path: &Path, root_dev: i32) -> (i64, i64, i64, HashMap
     (total_blocks, total_logical, total_count, families)
 }
 
-/// Insert a directory row with an explicit id and return the id actually used.
-/// Mirrors `_insert_dir_get_id` (`./duh:508-537`): on an `OR IGNORE` conflict
-/// (row already existed) look the existing id up by `(parent_id, name, scan_id)`.
-#[allow(clippy::too_many_arguments)]
-fn insert_dir_get_id(
-    con: &Connection,
-    next_id: &mut i64,
-    parent_id: Option<i64>,
-    name: &[u8],
-    is_excluded: i64,
-    dev: i32,
-    ino: u64,
-    clone_id: Option<u64>,
-    nlinks: u32,
-    size_logical: i64,
-    size_blocks: i64,
-    excluded_file_count: Option<i64>,
-    mtime: i64,
-    scan_id: i64,
-) -> rusqlite::Result<i64> {
-    let id = *next_id + 1;
-    let changed = con.execute(
-        INSERT_SQL,
-        rusqlite::params![
-            id,
-            parent_id,
-            RawText(name),
-            1i64, // is_dir
-            0i64, // is_symlink
-            is_excluded,
-            dev,
-            ino as i64,
-            clone_id.map(|c| c as i64),
-            nlinks as i64,
-            size_logical,
-            size_blocks,
-            excluded_file_count,
-            mtime,
-            scan_id,
-        ],
-    )?;
-    if changed > 0 {
-        *next_id = id;
-        return Ok(id);
-    }
-    // Row already existed (IGNORE fired) — look it up. `parent_id IS ?` matches
-    // NULL parents too, mirroring the Python lookup at ./duh:531-534.
-    con.query_row(
-        "SELECT id FROM files WHERE parent_id IS ? AND name = ? AND scan_id = ?",
-        rusqlite::params![parent_id, RawText(name), scan_id],
-        |r| r.get(0),
-    )
-}
-
-/// A batched leaf (file or symlink) row awaiting flush.
+/// A leaf (file or symlink) row bound for the writer.
 struct FileRow {
     id: i64,
     parent_id: i64,
@@ -281,37 +255,457 @@ struct FileRow {
     mtime: i64,
 }
 
-/// Flush the batched leaf rows inside a single transaction (Python's
-/// `executemany` + `commit`, `./duh:614-619`).
-fn flush(con: &Connection, batch: &mut Vec<FileRow>, scan_id: i64) -> rusqlite::Result<()> {
-    if batch.is_empty() {
-        return Ok(());
-    }
-    con.execute_batch("BEGIN")?;
-    {
-        let mut stmt = con.prepare_cached(INSERT_SQL)?;
-        for r in batch.iter() {
-            stmt.execute(rusqlite::params![
-                r.id,
-                r.parent_id,
-                RawText(&r.name),
-                0i64, // is_dir
-                r.is_symlink,
-                0i64, // is_excluded
-                r.dev,
-                r.ino as i64,
-                r.clone_id.map(|c| c as i64),
-                r.nlinks as i64,
-                r.size_logical,
-                r.size_blocks,
-                Option::<i64>::None, // excluded_file_count
-                r.mtime,
-                scan_id,
-            ])?;
+/// A directory row bound for the writer, plus any excluded-subtree clone families
+/// (empty for a normal, non-excluded directory). `families` carries tuples of
+/// `(clone_id, member_count, blocks_sum, max_blocks)`.
+struct DirRow {
+    id: i64,
+    parent_id: Option<i64>,
+    name: Vec<u8>,
+    is_excluded: i64,
+    dev: i32,
+    ino: u64,
+    clone_id: Option<u64>,
+    nlinks: u32,
+    size_logical: i64,
+    size_blocks: i64,
+    excluded_file_count: Option<i64>,
+    mtime: i64,
+    families: Vec<(u64, i64, i64, i64)>,
+}
+
+/// Messages a worker sends to the writer.
+enum Msg {
+    /// A batch of leaf rows (accumulated per directory, chunked at `BATCH_SIZE`).
+    Files(Vec<FileRow>),
+    /// A single directory row (and, for excluded dirs, its clone families).
+    Dir(DirRow),
+}
+
+/// A work item: `(parent_id, dir_path, rel_from_root)`.
+type WorkItem = (i64, PathBuf, String);
+
+/// Preassign the next id. Seeded so the first allocation is `MAX(id)+1`, matching
+/// the Python oracle's autoincrement. The `OR IGNORE` conflict branch of the
+/// reference is unreachable here (see module docs), so every allocated id is used.
+fn alloc(next_id: &AtomicI64) -> i64 {
+    next_id.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// Exact running totals for the `scans` row and progress lines. Written by workers
+/// as rows are emitted; read exactly by the writer (progress) and by `run_inner`
+/// after the workers have joined.
+#[derive(Default)]
+struct Totals {
+    files: AtomicI64,
+    logical: AtomicI64,
+    blocks: AtomicI64,
+    excluded: AtomicI64,
+}
+
+/// Shared work queue + termination bookkeeping for the worker pool.
+///
+/// `in_flight` counts items that are queued OR currently being processed. It
+/// starts at 1 (the root item) and is bumped for every subdirectory pushed;
+/// `finish_one` decrements it after a directory is fully processed. When it
+/// reaches 0 with an empty queue, the scan is structurally complete.
+struct Coord {
+    inner: Mutex<CoordInner>,
+    cv: Condvar,
+    /// Cheap poll flag for abort (SIGINT / disk guard). Also gates the wait loop.
+    abort: AtomicBool,
+}
+
+struct CoordInner {
+    queue: Vec<WorkItem>,
+    in_flight: usize,
+}
+
+impl Coord {
+    fn new(root: WorkItem) -> Self {
+        Coord {
+            inner: Mutex::new(CoordInner {
+                queue: vec![root],
+                in_flight: 1,
+            }),
+            cv: Condvar::new(),
+            abort: AtomicBool::new(false),
         }
     }
-    con.execute_batch("COMMIT")?;
-    batch.clear();
+
+    /// Block until a work item is available, the queue has drained AND all work is
+    /// done, or an abort was requested. Returns `None` to tell the worker to exit.
+    fn next(&self) -> Option<WorkItem> {
+        let mut g = self.inner.lock().unwrap();
+        loop {
+            if self.abort.load(Ordering::Relaxed) {
+                return None;
+            }
+            if let Some(item) = g.queue.pop() {
+                return Some(item);
+            }
+            if g.in_flight == 0 {
+                // Everything is done; wake the other sleepers so they exit too.
+                self.cv.notify_all();
+                return None;
+            }
+            g = self.cv.wait(g).unwrap();
+        }
+    }
+
+    /// Enqueue a subdirectory (bumps in-flight so termination waits for it).
+    fn push(&self, item: WorkItem) {
+        let mut g = self.inner.lock().unwrap();
+        g.in_flight += 1;
+        g.queue.push(item);
+        drop(g);
+        self.cv.notify_one();
+    }
+
+    /// Mark the current directory fully processed.
+    fn finish_one(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.in_flight -= 1;
+        if g.in_flight == 0 {
+            drop(g);
+            self.cv.notify_all();
+        }
+    }
+
+    /// Request an abort (idempotent). Holding the lock across `notify_all` closes
+    /// the lost-wakeup window against a worker about to `wait`.
+    fn request_abort(&self) {
+        if !self.abort.swap(true, Ordering::SeqCst) {
+            let _g = self.inner.lock().unwrap();
+            self.cv.notify_all();
+        }
+    }
+
+    fn aborted(&self) -> bool {
+        self.abort.load(Ordering::Relaxed)
+    }
+}
+
+/// Insert one directory row (and its excluded clone families, if any). Used by the
+/// writer for every directory and by `run_inner` for the root. `OR IGNORE` is kept
+/// for fidelity with the reference but never resolves a conflict (see module docs).
+fn write_dir(con: &Connection, d: &DirRow, scan_id: i64) -> rusqlite::Result<()> {
+    con.execute(
+        INSERT_SQL,
+        rusqlite::params![
+            d.id,
+            d.parent_id,
+            RawText(&d.name),
+            1i64, // is_dir
+            0i64, // is_symlink
+            d.is_excluded,
+            d.dev,
+            d.ino as i64,
+            d.clone_id.map(|c| c as i64),
+            d.nlinks as i64,
+            d.size_logical,
+            d.size_blocks,
+            d.excluded_file_count,
+            d.mtime,
+            scan_id,
+        ],
+    )?;
+    for (cid, cnt, bsum, bmax) in &d.families {
+        con.execute(
+            "INSERT OR REPLACE INTO excluded_families \
+             (excluded_id, clone_id, member_count, blocks_sum, max_blocks) \
+             VALUES (?,?,?,?,?)",
+            rusqlite::params![d.id, *cid as i64, cnt, bsum, bmax],
+        )?;
+    }
+    Ok(())
+}
+
+/// Try to send `msg`; on failure (the writer has gone away) request an abort and
+/// report false so the caller stops producing.
+fn try_send(tx: &Sender<Msg>, coord: &Coord, msg: Msg) -> bool {
+    if tx.send(msg).is_err() {
+        coord.request_abort();
+        false
+    } else {
+        true
+    }
+}
+
+/// One worker: pop directories off the shared queue, classify their entries the
+/// same way the reference does, preassign ids, and emit rows to the writer.
+#[allow(clippy::too_many_arguments)]
+fn worker(
+    tx: &Sender<Msg>,
+    coord: &Coord,
+    totals: &Totals,
+    next_id: &AtomicI64,
+    excludes: &Excludes,
+    perm_errors: &Mutex<HashSet<PathBuf>>,
+    root_dev: i32,
+    cross_device: bool,
+    no_clones: bool,
+) {
+    while let Some((parent_id, current_dir, rel_from_root)) = coord.next() {
+        let entries: Vec<EntryAttrs> = match attrs::read_dir_attrs(&current_dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                if perm_errors.lock().unwrap().insert(current_dir.clone()) {
+                    eprintln!("error: permission denied: {}", current_dir.display());
+                }
+                coord.finish_one();
+                continue;
+            }
+            Err(e) => {
+                eprintln!("error: scandir {}: {}", current_dir.display(), e);
+                coord.finish_one();
+                continue;
+            }
+        };
+
+        let mut batch: Vec<FileRow> = Vec::new();
+        for entry in &entries {
+            if coord.aborted() {
+                break;
+            }
+
+            // Cross-device skip (compare to root dev) unless --cross-device.
+            if !cross_device && entry.dev != root_dev {
+                continue;
+            }
+
+            let name_bytes = entry.name.as_bytes();
+            let name_str = entry.name.to_string_lossy();
+            let entry_path = current_dir.join(&entry.name);
+            let entry_rel = if rel_from_root.is_empty() {
+                name_str.to_string()
+            } else {
+                format!("{rel_from_root}/{name_str}")
+            };
+
+            let is_dir = entry.is_dir;
+            let is_symlink = entry.is_symlink;
+
+            // Exclusion check (dirs only), BEFORE clone-id collection (./duh:694-724).
+            if is_dir && !is_symlink && excludes.matches(&name_str, &entry_rel) {
+                let (agg_blocks, agg_logical, agg_count, families) =
+                    walk_for_aggregate(&entry_path, root_dev);
+                let fams: Vec<(u64, i64, i64, i64)> = families
+                    .into_iter()
+                    .map(|(cid, (cnt, bsum, bmax))| (cid, cnt, bsum, bmax))
+                    .collect();
+                let d = DirRow {
+                    id: alloc(next_id),
+                    parent_id: Some(parent_id),
+                    name: name_bytes.to_vec(),
+                    is_excluded: 1,
+                    dev: entry.dev,
+                    ino: entry.ino,
+                    clone_id: None, // clone_id NULL for excluded dirs
+                    nlinks: entry.nlink,
+                    size_logical: agg_logical,
+                    size_blocks: agg_blocks,
+                    excluded_file_count: Some(agg_count),
+                    mtime: entry.mtime,
+                    families: fams,
+                };
+                if !try_send(tx, coord, Msg::Dir(d)) {
+                    break;
+                }
+                totals.excluded.fetch_add(1, Ordering::Relaxed);
+                continue; // don't recurse
+            }
+
+            // clone_id for every non-symlink entry (files AND dirs) unless
+            // --no-clones (./duh:726-731). Directories need the extra syscall (the
+            // bulk reader gates clone_id to VREG); regular files reuse the id the
+            // bulk reader already extracted.
+            let clone_id = if no_clones || is_symlink {
+                None
+            } else if is_dir {
+                attrs::get_clone_id(&entry_path)
+            } else {
+                entry.clone_id
+            };
+
+            if is_dir && !is_symlink {
+                // Emit the dir row BEFORE enqueuing it, so no worker can dequeue it
+                // and emit its children before the parent row exists (module docs).
+                let id = alloc(next_id);
+                let d = DirRow {
+                    id,
+                    parent_id: Some(parent_id),
+                    name: name_bytes.to_vec(),
+                    is_excluded: 0,
+                    dev: entry.dev,
+                    ino: entry.ino,
+                    clone_id,
+                    nlinks: entry.nlink,
+                    size_logical: entry.size_logical as i64,
+                    size_blocks: entry.size_blocks as i64,
+                    excluded_file_count: None,
+                    mtime: entry.mtime,
+                    families: Vec::new(),
+                };
+                if !try_send(tx, coord, Msg::Dir(d)) {
+                    break;
+                }
+                coord.push((id, entry_path, entry_rel));
+            } else {
+                batch.push(FileRow {
+                    id: alloc(next_id),
+                    parent_id,
+                    name: name_bytes.to_vec(),
+                    is_symlink: if is_symlink { 1 } else { 0 },
+                    dev: entry.dev,
+                    ino: entry.ino,
+                    clone_id,
+                    nlinks: entry.nlink,
+                    size_logical: entry.size_logical as i64,
+                    size_blocks: entry.size_blocks as i64,
+                    mtime: entry.mtime,
+                });
+                totals.files.fetch_add(1, Ordering::Relaxed);
+                totals.logical.fetch_add(entry.size_logical as i64, Ordering::Relaxed);
+                totals.blocks.fetch_add(entry.size_blocks as i64, Ordering::Relaxed);
+                if batch.len() >= BATCH_SIZE && !try_send(tx, coord, Msg::Files(std::mem::take(&mut batch))) {
+                    break;
+                }
+            }
+        }
+
+        if !batch.is_empty() {
+            try_send(tx, coord, Msg::Files(batch));
+        }
+        coord.finish_one();
+    }
+}
+
+/// The sole DB-writing thread. Drains `Msg`s into ~`BATCH_SIZE`-row transactions,
+/// hosts the 5s progress line and 10s disk guard, translates SIGINT into an abort,
+/// then finalizes the `scans` row and invalidates the freeable cache.
+#[allow(clippy::too_many_arguments)]
+fn writer(
+    con: Connection,
+    rx: crossbeam_channel::Receiver<Msg>,
+    coord: &Coord,
+    totals: &Totals,
+    scan_id: i64,
+    quiet: bool,
+    db_dir: &Path,
+    min_free: f64,
+    scan_start: Instant,
+    disk_abort: &AtomicBool,
+) -> rusqlite::Result<()> {
+    // Disable FK enforcement for the bulk load; integrity is guaranteed
+    // structurally and insert order is irrelevant to content (module docs).
+    con.pragma_update(None, "foreign_keys", "OFF")?;
+
+    let mut in_txn = false;
+    let mut rows_in_txn = 0usize;
+    let mut last_progress = Instant::now();
+    let mut last_disk_check = Instant::now();
+
+    loop {
+        // Timers are polled every iteration (not just on idle) so progress lines
+        // still appear under a continuous message stream.
+        if !quiet && last_progress.elapsed().as_secs_f64() >= PROGRESS_INTERVAL {
+            let files = totals.files.load(Ordering::Relaxed);
+            let elapsed = scan_start.elapsed().as_secs_f64();
+            let rate = if elapsed > 0.0 { files as f64 / elapsed } else { 0.0 };
+            eprintln!(
+                "[{} files, {} excluded, {} scanned, {:.0} files/sec]",
+                fmt_thousands(files),
+                totals.excluded.load(Ordering::Relaxed),
+                fmt_bytes(totals.blocks.load(Ordering::Relaxed)),
+                rate
+            );
+            last_progress = Instant::now();
+        }
+        if last_disk_check.elapsed().as_secs_f64() >= DISK_CHECK_INTERVAL {
+            if !disk_abort.load(Ordering::Relaxed) && free_gib(db_dir) < min_free {
+                eprintln!(
+                    "error: free disk below {} GiB (currently {:.2} GiB), aborting scan",
+                    min_free,
+                    free_gib(db_dir)
+                );
+                disk_abort.store(true, Ordering::SeqCst);
+                coord.request_abort();
+            }
+            last_disk_check = Instant::now();
+        }
+        // SIGINT → abort (the handler only flips INTERRUPTED; the writer owns the
+        // translation so workers have a single stop signal).
+        if INTERRUPTED.load(Ordering::SeqCst) && !coord.aborted() {
+            coord.request_abort();
+        }
+
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(msg) => {
+                if !in_txn {
+                    con.execute_batch("BEGIN")?;
+                    in_txn = true;
+                }
+                match msg {
+                    Msg::Files(rows) => {
+                        let mut stmt = con.prepare_cached(INSERT_SQL)?;
+                        for r in &rows {
+                            stmt.execute(rusqlite::params![
+                                r.id,
+                                r.parent_id,
+                                RawText(&r.name),
+                                0i64, // is_dir
+                                r.is_symlink,
+                                0i64, // is_excluded
+                                r.dev,
+                                r.ino as i64,
+                                r.clone_id.map(|c| c as i64),
+                                r.nlinks as i64,
+                                r.size_logical,
+                                r.size_blocks,
+                                Option::<i64>::None, // excluded_file_count
+                                r.mtime,
+                                scan_id,
+                            ])?;
+                            rows_in_txn += 1;
+                        }
+                    }
+                    Msg::Dir(d) => {
+                        write_dir(&con, &d, scan_id)?;
+                        rows_in_txn += 1;
+                    }
+                }
+                if rows_in_txn >= BATCH_SIZE {
+                    con.execute_batch("COMMIT")?;
+                    in_txn = false;
+                    rows_in_txn = 0;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    if in_txn {
+        con.execute_batch("COMMIT")?;
+    }
+
+    con.execute(
+        "UPDATE scans SET finished_at=?, files_count=?, excluded_count=?, \
+         bytes_logical=?, bytes_blocks=? WHERE id=?",
+        rusqlite::params![
+            now_secs(),
+            totals.files.load(Ordering::Relaxed),
+            totals.excluded.load(Ordering::Relaxed),
+            totals.logical.load(Ordering::Relaxed),
+            totals.blocks.load(Ordering::Relaxed),
+            scan_id
+        ],
+    )?;
+
+    // Invalidate the freeable cache (./duh:808-816). The table always exists here.
+    con.execute("DELETE FROM freeable_cache", [])?;
+    eprintln!("[scan] freeable cache invalidated");
     Ok(())
 }
 
@@ -333,7 +727,7 @@ pub fn run(args: ScanArgs, db_path: &Path) -> ExitCode {
         }
     };
 
-    match run_inner(&args, db_path, &con, &root) {
+    match run_inner(&args, db_path, con, &root) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("error: {e}");
@@ -345,7 +739,7 @@ pub fn run(args: ScanArgs, db_path: &Path) -> ExitCode {
 fn run_inner(
     args: &ScanArgs,
     db_path: &Path,
-    con: &Connection,
+    con: Connection,
     root: &Path,
 ) -> rusqlite::Result<ExitCode> {
     let root_bytes = root.as_os_str().as_bytes();
@@ -414,236 +808,114 @@ fn run_inner(
     let excludes = Excludes::from_args(&args.exclude, &args.include, args.no_default_excludes);
 
     // Seed the explicit id counter (see module docs).
-    let mut next_id: i64 =
-        con.query_row("SELECT COALESCE(MAX(id),0) FROM files", [], |r| r.get(0))?;
+    let seed: i64 = con.query_row("SELECT COALESCE(MAX(id),0) FROM files", [], |r| r.get(0))?;
+    let next_id = AtomicI64::new(seed);
 
-    // Install the SIGINT handler (graceful stop → flush + finalize).
+    // Install the SIGINT handler (graceful stop → drain + finalize).
     INTERRUPTED.store(false, Ordering::SeqCst);
     unsafe {
         libc::signal(libc::SIGINT, handle_sigint as libc::sighandler_t);
     }
 
-    let mut total_files: i64 = 0;
-    let mut total_logical: i64 = 0;
-    let mut total_blocks: i64 = 0;
-    let mut total_excluded: i64 = 0;
-    let mut batch: Vec<FileRow> = Vec::new();
-
-    let mut disk_abort = false;
-    let scan_start = Instant::now();
-    let mut last_progress = Instant::now();
-    let mut last_disk_check = Instant::now();
-
-    // Insert the root dir. Its name is the FULL realpath; clone_id comes from
-    // get_clone_id(root) regardless of it being a directory (./duh:628-650) —
-    // this is why we do NOT reuse root_stat.clone_id (which is None for dirs).
+    // Insert the root dir on this setup thread, before the connection moves to the
+    // writer. Its name is the FULL realpath; clone_id comes from get_clone_id(root)
+    // regardless of it being a directory (./duh:628-650) — this is why we do NOT
+    // reuse root_stat.clone_id (which is None for dirs).
     let root_clone = if args.no_clones {
         None
     } else {
         attrs::get_clone_id(root)
     };
-    let root_dir_id = insert_dir_get_id(
-        con,
-        &mut next_id,
-        None,
-        root_bytes,
-        0,
-        root_stat.dev,
-        root_stat.ino,
-        root_clone,
-        root_stat.nlink,
-        root_stat.size_logical as i64,
-        root_stat.size_blocks as i64,
-        None,
-        root_stat.mtime,
-        scan_id,
-    )?;
+    let root_dir = DirRow {
+        id: alloc(&next_id),
+        parent_id: None,
+        name: root_bytes.to_vec(),
+        is_excluded: 0,
+        dev: root_stat.dev,
+        ino: root_stat.ino,
+        clone_id: root_clone,
+        nlinks: root_stat.nlink,
+        size_logical: root_stat.size_logical as i64,
+        size_blocks: root_stat.size_blocks as i64,
+        excluded_file_count: None,
+        mtime: root_stat.mtime,
+        families: Vec::new(),
+    };
+    write_dir(&con, &root_dir, scan_id)?;
+    let root_dir_id = root_dir.id;
 
-    // DFS stack: (parent_id, dir_path, rel_from_root).
-    let mut stack: Vec<(i64, PathBuf, String)> = vec![(root_dir_id, root.to_path_buf(), String::new())];
-    let mut permission_errors: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    // Shared state for the pool. The writer owns `con`; the workers borrow the
+    // rest for the duration of the scoped threads (no `Arc` needed).
+    let coord = Coord::new((root_dir_id, root.to_path_buf(), String::new()));
+    let totals = Totals::default();
+    let perm_errors: Mutex<HashSet<PathBuf>> = Mutex::new(HashSet::new());
+    let disk_abort = AtomicBool::new(false);
+    let (tx, rx) = bounded::<Msg>(64);
 
-    while let Some((parent_id, current_dir, rel_from_root)) = stack.pop() {
-        if INTERRUPTED.load(Ordering::SeqCst) || disk_abort {
-            break;
-        }
+    let nworkers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let scan_start = Instant::now();
 
-        let entries: Vec<EntryAttrs> = match attrs::read_dir_attrs(&current_dir) {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                if permission_errors.insert(current_dir.clone()) {
-                    eprintln!("error: permission denied: {}", current_dir.display());
-                }
-                continue;
-            }
-            Err(e) => {
-                eprintln!("error: scandir {}: {}", current_dir.display(), e);
-                continue;
-            }
-        };
+    // Reference bindings so the `move` closures capture (Copy) references to the
+    // shared state rather than trying to move the state itself.
+    let coord_r = &coord;
+    let totals_r = &totals;
+    let next_id_r = &next_id;
+    let excludes_r = &excludes;
+    let perm_r = &perm_errors;
+    let disk_r = &disk_abort;
+    let db_dir_r = db_dir.as_path();
 
-        for entry in &entries {
-            if INTERRUPTED.load(Ordering::SeqCst) || disk_abort {
-                break;
-            }
-
-            // Cross-device skip (compare to root dev) unless --cross-device.
-            if !args.cross_device && entry.dev != root_dev {
-                continue;
-            }
-
-            let name_bytes = entry.name.as_bytes();
-            let name_str = entry.name.to_string_lossy();
-            let entry_path = current_dir.join(&entry.name);
-            let entry_rel = if rel_from_root.is_empty() {
-                name_str.to_string()
-            } else {
-                format!("{rel_from_root}/{name_str}")
-            };
-
-            let is_dir = entry.is_dir;
-            let is_symlink = entry.is_symlink;
-
-            // Exclusion check (dirs only), BEFORE clone-id collection (./duh:694-724).
-            if is_dir && !is_symlink && excludes.matches(&name_str, &entry_rel) {
-                flush(con, &mut batch, scan_id)?;
-                let (agg_blocks, agg_logical, agg_count, families) =
-                    walk_for_aggregate(&entry_path, root_dev);
-                let excl_id = insert_dir_get_id(
-                    con,
-                    &mut next_id,
-                    Some(parent_id),
-                    name_bytes,
-                    1, // is_excluded
-                    entry.dev,
-                    entry.ino,
-                    None, // clone_id NULL for excluded dirs
-                    entry.nlink,
-                    agg_logical,
-                    agg_blocks,
-                    Some(agg_count),
-                    entry.mtime,
-                    scan_id,
-                )?;
-                for (cid, (cnt, bsum, bmax)) in &families {
-                    con.execute(
-                        "INSERT OR REPLACE INTO excluded_families \
-                         (excluded_id, clone_id, member_count, blocks_sum, max_blocks) \
-                         VALUES (?,?,?,?,?)",
-                        rusqlite::params![excl_id, *cid as i64, cnt, bsum, bmax],
-                    )?;
-                }
-                total_excluded += 1;
-                continue; // don't recurse
-            }
-
-            // clone_id for every non-symlink entry (files AND dirs) unless
-            // --no-clones (./duh:726-731). For regular files, reuse the clone id
-            // already extracted by read_dir_attrs (same ATTR_CMNEXT_CLONEID flags
-            // and zero→None logic — verified byte-identical to per-path
-            // get_clone_id in the parity diff). Only directories need the extra
-            // syscall: the bulk reader gates clone_id to VREG, but the reference
-            // records a dir's own clone id too.
-            let clone_id = if args.no_clones || is_symlink {
-                None
-            } else if is_dir {
-                attrs::get_clone_id(&entry_path)
-            } else {
-                entry.clone_id
-            };
-
-            if is_dir && !is_symlink {
-                flush(con, &mut batch, scan_id)?;
-                let new_id = insert_dir_get_id(
-                    con,
-                    &mut next_id,
-                    Some(parent_id),
-                    name_bytes,
-                    0,
-                    entry.dev,
-                    entry.ino,
-                    clone_id,
-                    entry.nlink,
-                    entry.size_logical as i64,
-                    entry.size_blocks as i64,
-                    None,
-                    entry.mtime,
-                    scan_id,
-                )?;
-                stack.push((new_id, entry_path, entry_rel));
-            } else {
-                next_id += 1;
-                batch.push(FileRow {
-                    id: next_id,
-                    parent_id,
-                    name: name_bytes.to_vec(),
-                    is_symlink: if is_symlink { 1 } else { 0 },
-                    dev: entry.dev,
-                    ino: entry.ino,
-                    clone_id,
-                    nlinks: entry.nlink,
-                    size_logical: entry.size_logical as i64,
-                    size_blocks: entry.size_blocks as i64,
-                    mtime: entry.mtime,
-                });
-                total_files += 1;
-                total_logical += entry.size_logical as i64;
-                total_blocks += entry.size_blocks as i64;
-                if batch.len() >= BATCH_SIZE {
-                    flush(con, &mut batch, scan_id)?;
-                }
-            }
-
-            // Progress line every 5s (./duh:776-784).
-            if !args.quiet && last_progress.elapsed().as_secs_f64() >= PROGRESS_INTERVAL {
-                let elapsed = scan_start.elapsed().as_secs_f64();
-                let rate = if elapsed > 0.0 { total_files as f64 / elapsed } else { 0.0 };
-                eprintln!(
-                    "[{} files, {} excluded, {} scanned, {:.0} files/sec]",
-                    fmt_thousands(total_files),
-                    total_excluded,
-                    fmt_bytes(total_blocks),
-                    rate
+    let writer_result: rusqlite::Result<()> = std::thread::scope(|s| {
+        // Writer thread: owns `con` and `rx`.
+        let wh = s.spawn(move || {
+            writer(
+                con,
+                rx,
+                coord_r,
+                totals_r,
+                scan_id,
+                args.quiet,
+                db_dir_r,
+                args.min_free,
+                scan_start,
+                disk_r,
+            )
+        });
+        // Worker threads: each owns a `Sender` clone (dropped on exit → the writer
+        // sees `Disconnected` once every worker has finished).
+        let mut whs = Vec::with_capacity(nworkers);
+        for _ in 0..nworkers {
+            let txc = tx.clone();
+            whs.push(s.spawn(move || {
+                worker(
+                    &txc,
+                    coord_r,
+                    totals_r,
+                    next_id_r,
+                    excludes_r,
+                    perm_r,
+                    root_dev,
+                    args.cross_device,
+                    args.no_clones,
                 );
-                last_progress = Instant::now();
-            }
-
-            // Disk safety check every 10s (./duh:787-796).
-            if last_disk_check.elapsed().as_secs_f64() >= DISK_CHECK_INTERVAL {
-                let free = free_gib(&db_dir);
-                if free < args.min_free {
-                    eprintln!(
-                        "error: free disk below {} GiB (currently {:.2} GiB), aborting scan",
-                        args.min_free, free
-                    );
-                    disk_abort = true;
-                }
-                last_disk_check = Instant::now();
-            }
+            }));
         }
-    }
+        drop(tx); // this thread's clone; workers hold the rest
+        for h in whs {
+            h.join().unwrap();
+        }
+        wh.join().unwrap()
+    });
+    writer_result?;
 
-    flush(con, &mut batch, scan_id)?;
+    let total_files = totals.files.load(Ordering::Relaxed);
+    let total_logical = totals.logical.load(Ordering::Relaxed);
+    let total_blocks = totals.blocks.load(Ordering::Relaxed);
+    let total_excluded = totals.excluded.load(Ordering::Relaxed);
 
-    con.execute(
-        "UPDATE scans SET finished_at=?, files_count=?, excluded_count=?, \
-         bytes_logical=?, bytes_blocks=? WHERE id=?",
-        rusqlite::params![
-            now_secs(),
-            total_files,
-            total_excluded,
-            total_logical,
-            total_blocks,
-            scan_id
-        ],
-    )?;
-
-    // Invalidate the freeable cache (./duh:808-816). The table always exists here
-    // (db::open applies the full schema), so no OperationalError to swallow.
-    con.execute("DELETE FROM freeable_cache", [])?;
-    eprintln!("[scan] freeable cache invalidated");
-
-    if disk_abort {
+    if disk_abort.load(Ordering::Relaxed) {
         return Ok(ExitCode::from(EX_TEMPFAIL));
     }
 
