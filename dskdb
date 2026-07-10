@@ -1,0 +1,3210 @@
+#!/usr/bin/env python3
+"""dskdb v2 — macOS APFS-aware disk-usage database CLI.
+
+Detects hardlinks AND APFS clones (via getattrlist ATTR_CMNEXT_CLONEID).
+macOS-only. stdlib only.
+
+v2 changes:
+- parent_id replaces parent_path (compact adjacency-list schema)
+- Default exclusions for regenerable trees (node_modules, .venv, etc.)
+- Disk-safety monitor aborts scan if free space drops below threshold
+- 256 MB query cache for analytical commands
+- New `excluded` subcommand to show skipped subtrees
+"""
+
+from __future__ import annotations
+
+import argparse
+import array
+import collections
+import ctypes
+import ctypes.util
+import json
+import os
+import signal
+import sqlite3
+import struct
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Platform check
+# ---------------------------------------------------------------------------
+if sys.platform != "darwin":
+    sys.exit("error: dskdb is macOS-only")
+
+# ---------------------------------------------------------------------------
+# DB path
+# ---------------------------------------------------------------------------
+_DEFAULT_DB = os.path.expanduser("~/.local/share/dskdb/scan.db")
+DB_PATH = os.environ.get("DSKDB_DB", _DEFAULT_DB)
+
+# ---------------------------------------------------------------------------
+# getattrlist ctypes binding (unchanged from v1)
+# ---------------------------------------------------------------------------
+ATTR_BIT_MAP_COUNT       = 5
+ATTR_CMN_RETURNED_ATTRS  = 0x80000000
+ATTR_CMNEXT_CLONEID      = 0x00000100  # NOTE: spec says 0x40 but actual value is 0x100
+FSOPT_NOFOLLOW           = 0x00000001
+FSOPT_PACK_INVAL_ATTRS   = 0x00000008
+FSOPT_ATTR_CMN_EXTENDED  = 0x00000020
+
+_ATTRLIST_FMT = "HHIIIIi"
+_ATTRLIST_SIZE = struct.calcsize(_ATTRLIST_FMT)  # should be 24
+_BUF_SIZE = 64
+
+try:
+    _libc = ctypes.CDLL(ctypes.util.find_library("System"), use_errno=True)
+    _getattrlist = _libc.getattrlist
+    _getattrlist.restype = ctypes.c_int
+    _getattrlist.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_ulong,
+    ]
+    _GETATTRLIST_OK = True
+except Exception:
+    _GETATTRLIST_OK = False
+
+
+def get_clone_id(path: str) -> int | None:
+    """Return APFS clone ID for path, or None if unavailable/unsupported."""
+    if not _GETATTRLIST_OK:
+        return None
+
+    attrlist_buf = struct.pack(
+        _ATTRLIST_FMT,
+        ATTR_BIT_MAP_COUNT,
+        0,
+        ATTR_CMN_RETURNED_ATTRS,
+        0,
+        0,
+        0,
+        ATTR_CMNEXT_CLONEID,
+    )
+    attrlist_c = ctypes.create_string_buffer(attrlist_buf)
+    out_buf = ctypes.create_string_buffer(_BUF_SIZE)
+    options = ctypes.c_ulong(FSOPT_NOFOLLOW | FSOPT_PACK_INVAL_ATTRS | FSOPT_ATTR_CMN_EXTENDED)
+
+    ret = _getattrlist(
+        path.encode("utf-8", errors="surrogateescape"),
+        attrlist_c,
+        out_buf,
+        ctypes.c_size_t(_BUF_SIZE),
+        options,
+    )
+    if ret != 0:
+        return None
+
+    raw = bytes(out_buf)
+    total_len = struct.unpack_from("<I", raw, 0)[0]
+    if total_len < 32:
+        return None
+
+    returned_forkattr = struct.unpack_from("<I", raw, 20)[0]
+    if not (returned_forkattr & ATTR_CMNEXT_CLONEID):
+        return None
+
+    clone_id = struct.unpack_from("<Q", raw, 24)[0]
+    if clone_id == 0:
+        return None
+    return clone_id
+
+
+# ---------------------------------------------------------------------------
+# Verification test for ctypes binding (unchanged from v1)
+# ---------------------------------------------------------------------------
+def cmd_selftest(_args: argparse.Namespace) -> None:
+    """Verify APFS clone detection via a real clone/copy test."""
+    import shutil
+    print("Running clone-detection self-test...")
+
+    home_tmp = os.path.join(os.path.expanduser("~"), "tmp-dskdb-selftest")
+    os.makedirs(home_tmp, exist_ok=True)
+    import time as _time
+    tmpdir = os.path.join(home_tmp, f"run-{int(_time.time() * 1000)}")
+    os.makedirs(tmpdir)
+    src   = os.path.join(tmpdir, "src")
+    clone = os.path.join(tmpdir, "clone")
+    copy  = os.path.join(tmpdir, "copy")
+
+    try:
+        with open(src, "wb") as f:
+            f.write(os.urandom(1 * 1024 * 1024))
+
+        ret = os.system(f"cp -c {src!r} {clone!r} 2>/dev/null")
+        if ret != 0:
+            print("  warning: cp -c returned non-zero (not on APFS?)")
+
+        shutil.copy2(src, copy)
+
+        src_id   = get_clone_id(src)
+        clone_id = get_clone_id(clone)
+        copy_id  = get_clone_id(copy)
+
+        print(f"  src   clone_id = {src_id}")
+        print(f"  clone clone_id = {clone_id}")
+        print(f"  copy  clone_id = {copy_id}")
+
+        ok_clone = (src_id is not None) and (src_id == clone_id)
+        ok_copy  = (copy_id is None) or (copy_id != src_id)
+
+        if ok_clone and ok_copy:
+            print("  PASS: src and clone share clone_id; copy has different clone_id")
+        elif not ok_clone:
+            print("  FAIL: src and clone do NOT share clone_id — ctypes plumbing issue")
+            sys.exit(1)
+        else:
+            print(f"  WARN: copy has same clone_id as src ({copy_id}) — unexpected")
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        try:
+            os.rmdir(home_tmp)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# IEC formatting helpers
+# ---------------------------------------------------------------------------
+def fmt_bytes(n: int) -> str:
+    if n < 0:
+        return f"-{fmt_bytes(-n)}"
+    for unit, threshold in (("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)):
+        if n >= threshold:
+            return f"{n / threshold:.1f} {unit}"
+    return f"{n} B"
+
+
+def fmt_bytes_highlight(real: int, apparent: int) -> str:
+    s = fmt_bytes(apparent)
+    if real > 0 and abs(apparent - real) / real > 0.05:
+        return f"({s})"
+    return s
+
+
+def col_width(items: list[str], header: str) -> int:
+    return max(len(header), *(len(s) for s in items)) if items else len(header)
+
+
+# ---------------------------------------------------------------------------
+# Default exclusions
+# ---------------------------------------------------------------------------
+DEFAULT_EXCLUDES = {
+    "node_modules",
+    ".venv",
+    "venv",
+    ".git/objects",
+    ".terraform/providers",
+    ".terraform/modules",
+    ".next/cache",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "target",  # Rust
+}
+
+# Multi-component excludes (match on last N components of path)
+_MULTI_COMPONENT_EXCLUDES = {
+    ".git/objects",
+    ".terraform/providers",
+    ".terraform/modules",
+    ".next/cache",
+}
+
+# Single-name excludes (match on directory name only)
+_SINGLE_NAME_EXCLUDES = DEFAULT_EXCLUDES - _MULTI_COMPONENT_EXCLUDES
+
+
+def build_excludes(args: argparse.Namespace) -> tuple[set[str], set[str]]:
+    """Return (single_name_excludes, multi_component_excludes) based on CLI args."""
+    if args.no_default_excludes:
+        single = set()
+        multi = set()
+    else:
+        single = set(_SINGLE_NAME_EXCLUDES)
+        multi = set(_MULTI_COMPONENT_EXCLUDES)
+
+    # --include removes from defaults
+    for name in getattr(args, "include", []) or []:
+        single.discard(name)
+        multi.discard(name)
+
+    # --exclude adds extra single-name patterns
+    for name in getattr(args, "exclude", []) or []:
+        single.add(name)
+
+    return single, multi
+
+
+def is_excluded(name: str, rel_path_from_root: str, single: set[str], multi: set[str]) -> bool:
+    """Check if a directory entry should be excluded."""
+    if name in single:
+        return True
+    # For multi-component patterns, check if rel_path ends with the pattern
+    for pat in multi:
+        if rel_path_from_root.endswith(pat) or rel_path_from_root == pat:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Disk safety monitor
+# ---------------------------------------------------------------------------
+MIN_FREE_GIB_DEFAULT = 3.0
+EX_TEMPFAIL = 75
+
+
+def free_gib(path: str = None) -> float:
+    """Return free GiB on the volume containing path."""
+    check_path = path or DB_PATH
+    try:
+        s = os.statvfs(check_path)
+        return (s.f_bavail * s.f_frsize) / (1024 ** 3)
+    except OSError:
+        return float("inf")
+
+
+# ---------------------------------------------------------------------------
+# DB helpers
+# ---------------------------------------------------------------------------
+def open_db(path: str = None, cache_mb: int = 64) -> sqlite3.Connection:
+    p = path or DB_PATH
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    con = sqlite3.connect(p)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode = WAL")
+    con.execute("PRAGMA synchronous = NORMAL")
+    con.execute(f"PRAGMA cache_size = -{cache_mb * 1000}")
+    con.execute("PRAGMA foreign_keys = ON")
+    return con
+
+
+def open_db_for_read(path: str = None) -> sqlite3.Connection:
+    """Open DB with 256 MB cache for analytical queries."""
+    return open_db(path=path, cache_mb=256)
+
+
+def _init_schema(con: sqlite3.Connection) -> None:
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS scans (
+      id INTEGER PRIMARY KEY,
+      root TEXT NOT NULL,
+      started_at REAL NOT NULL,
+      finished_at REAL,
+      files_count INTEGER,
+      excluded_count INTEGER,
+      bytes_logical INTEGER,
+      bytes_blocks INTEGER,
+      schema_version INTEGER DEFAULT 2
+    );
+
+    CREATE TABLE IF NOT EXISTS files (
+      id INTEGER PRIMARY KEY,
+      parent_id INTEGER REFERENCES files(id),
+      name TEXT NOT NULL,
+      is_dir INTEGER NOT NULL,
+      is_symlink INTEGER NOT NULL,
+      is_excluded INTEGER NOT NULL DEFAULT 0,
+      dev INTEGER NOT NULL,
+      ino INTEGER NOT NULL,
+      clone_id INTEGER,
+      nlinks INTEGER NOT NULL,
+      size_logical INTEGER NOT NULL,
+      size_blocks INTEGER NOT NULL,
+      excluded_file_count INTEGER,
+      mtime INTEGER NOT NULL,
+      scan_id INTEGER NOT NULL REFERENCES scans(id),
+      UNIQUE(parent_id, name)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_files_parent ON files(parent_id);
+    CREATE INDEX IF NOT EXISTS idx_files_clone ON files(clone_id) WHERE clone_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_files_inode ON files(dev, ino) WHERE nlinks > 1;
+    CREATE INDEX IF NOT EXISTS idx_files_excluded ON files(is_excluded) WHERE is_excluded = 1;
+
+    CREATE TABLE IF NOT EXISTS excluded_families (
+      excluded_id INTEGER NOT NULL REFERENCES files(id),
+      clone_id INTEGER NOT NULL,
+      member_count INTEGER NOT NULL,
+      blocks_sum INTEGER NOT NULL,
+      max_blocks INTEGER NOT NULL,
+      PRIMARY KEY (excluded_id, clone_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_excluded_families_clone ON excluded_families(clone_id);
+    """)
+    con.commit()
+
+
+# ---------------------------------------------------------------------------
+# Path helpers
+# ---------------------------------------------------------------------------
+def full_path(con: sqlite3.Connection, file_id: int) -> str:
+    """Reconstruct full filesystem path from file_id via recursive CTE."""
+    rows = con.execute("""
+      WITH RECURSIVE chain(id, parent_id, name) AS (
+        SELECT id, parent_id, name FROM files WHERE id = ?
+        UNION ALL
+        SELECT f.id, f.parent_id, f.name FROM files f, chain c WHERE f.id = c.parent_id
+      )
+      SELECT name FROM chain
+    """, (file_id,)).fetchall()
+    parts = [r[0] for r in rows]
+    parts.reverse()
+    # parts[0] is the root entry name (e.g. "/" or "Users" etc.)
+    # The root row has parent_id = NULL and name = the root dir name or "/"
+    if not parts:
+        return ""
+    if parts[0] == "/":
+        return "/" + "/".join(parts[1:])
+    # Root stored as full path in name when it has no parent
+    if len(parts) == 1:
+        return parts[0]
+    return parts[0] + "/" + "/".join(parts[1:])
+
+
+def resolve_path_to_id(con: sqlite3.Connection, path: str) -> int | None:
+    """Walk path components top-down in the DB to find the file_id."""
+    # Find the root entry: parent_id IS NULL and name matches the root
+    # The root row is inserted with parent_id=NULL and name=realpath(root)
+    # For non-root paths, walk from the root row downward by name components
+    norm = os.path.normpath(path)
+
+    # Fast path: check if norm matches a root-level entry (parent_id IS NULL)
+    row = con.execute(
+        "SELECT id FROM files WHERE parent_id IS NULL AND name = ?", (norm,)
+    ).fetchone()
+    if row:
+        return row[0]
+
+    # Split into components and walk down
+    parts = norm.split("/")
+    # parts[0] == "" for absolute paths (leading slash)
+    # Find root whose name starts with the path prefix
+    # Strategy: find root entries, pick the one that is an ancestor of norm
+    roots = con.execute(
+        "SELECT id, name FROM files WHERE parent_id IS NULL"
+    ).fetchall()
+
+    start_id = None
+    remaining = []
+    for r in roots:
+        rname = r["name"]
+        if norm == rname:
+            return r["id"]
+        if norm.startswith(rname + "/"):
+            suffix = norm[len(rname) + 1:]
+            remaining = [p for p in suffix.split("/") if p]
+            start_id = r["id"]
+            break
+
+    if start_id is None:
+        return None
+
+    cur_id = start_id
+    for part in remaining:
+        row = con.execute(
+            "SELECT id FROM files WHERE parent_id = ? AND name = ?", (cur_id, part)
+        ).fetchone()
+        if not row:
+            return None
+        cur_id = row["id"]
+    return cur_id
+
+
+def descendant_ids_cte(file_id: int) -> tuple[str, dict]:
+    """Return (CTE SQL fragment, params) that produces all descendant ids including the root."""
+    sql = """
+      WITH RECURSIVE desc_ids(id) AS (
+        SELECT id FROM files WHERE id = :root_id
+        UNION ALL
+        SELECT f.id FROM files f JOIN desc_ids d ON f.parent_id = d.id
+      )
+    """
+    return sql, {"root_id": file_id}
+
+
+# ---------------------------------------------------------------------------
+# Aggregate walk for excluded directories
+# ---------------------------------------------------------------------------
+def walk_for_aggregate(dir_path: str, root_dev: int) -> tuple[int, int, int, dict]:
+    """Walk dir_path without inserting DB rows.
+    Returns (blocks, logical, count, clone_families) where
+    clone_families maps clone_id -> (count, blocks_sum, max_blocks).
+    """
+    total_blocks = 0
+    total_logical = 0
+    total_count = 0
+    clone_families: dict[int, list] = {}  # clone_id -> [count, blocks_sum, max_blocks]
+    stack = [dir_path]
+    while stack:
+        d = stack.pop()
+        try:
+            entries = list(os.scandir(d))
+        except (PermissionError, OSError):
+            continue
+        for e in entries:
+            try:
+                st = e.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if st.st_dev != root_dev:
+                continue
+            blk = st.st_blocks * 512
+            total_blocks += blk
+            total_logical += st.st_size
+            total_count += 1
+            if e.is_dir(follow_symlinks=False) and not e.is_symlink():
+                stack.append(e.path)
+            elif not e.is_symlink():
+                # Try to get clone_id for non-symlink files
+                try:
+                    cid = get_clone_id(e.path)
+                except Exception:
+                    cid = None
+                if cid is not None:
+                    if cid not in clone_families:
+                        clone_families[cid] = [0, 0, 0]
+                    rec = clone_families[cid]
+                    rec[0] += 1
+                    rec[1] += blk
+                    if blk > rec[2]:
+                        rec[2] = blk
+    # Convert to immutable tuples
+    result: dict[int, tuple[int, int, int]] = {
+        cid: (v[0], v[1], v[2]) for cid, v in clone_families.items()
+    }
+    return total_blocks, total_logical, total_count, result
+
+
+# ---------------------------------------------------------------------------
+# SCAN subcommand
+# ---------------------------------------------------------------------------
+_BATCH_SIZE = 1000
+_PROGRESS_INTERVAL = 5.0
+_DISK_CHECK_INTERVAL = 10.0
+
+_INSERT_FILE_SQL = """
+INSERT OR IGNORE INTO files
+  (parent_id, name, is_dir, is_symlink, is_excluded, dev, ino, clone_id,
+   nlinks, size_logical, size_blocks, excluded_file_count, mtime, scan_id)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+"""
+
+_INSERT_DIR_SQL = """
+INSERT OR IGNORE INTO files
+  (parent_id, name, is_dir, is_symlink, is_excluded, dev, ino, clone_id,
+   nlinks, size_logical, size_blocks, excluded_file_count, mtime, scan_id)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+"""
+
+
+def _insert_dir_get_id(
+    con: sqlite3.Connection,
+    parent_id: int | None,
+    name: str,
+    is_excluded: int,
+    dev: int,
+    ino: int,
+    clone_id: int | None,
+    nlinks: int,
+    size_logical: int,
+    size_blocks: int,
+    excluded_file_count: int | None,
+    mtime: int,
+    scan_id: int,
+) -> int:
+    """Insert a directory row and return its id."""
+    cur = con.execute(_INSERT_DIR_SQL, (
+        parent_id, name, 1, 0, is_excluded, dev, ino, clone_id,
+        nlinks, size_logical, size_blocks, excluded_file_count, mtime, scan_id,
+    ))
+    if cur.lastrowid and cur.lastrowid > 0:
+        return cur.lastrowid
+    # Row already existed (IGNORE fired) — look it up
+    row = con.execute(
+        "SELECT id FROM files WHERE parent_id IS ? AND name = ? AND scan_id = ?",
+        (parent_id, name, scan_id),
+    ).fetchone()
+    if row:
+        return row[0]
+    raise RuntimeError(f"Failed to insert/find dir row: parent={parent_id} name={name!r}")
+
+
+def cmd_scan(args: argparse.Namespace) -> None:
+    root = os.path.realpath(args.path)
+    if not os.path.exists(root):
+        sys.exit(f"error: path not found: {root}")
+
+    min_free = args.min_free
+    con = open_db(cache_mb=64)
+    _init_schema(con)
+
+    # --rescan: delete existing rows for this root
+    if args.rescan:
+        # Find the scan(s) for this root and delete their file rows
+        old_scans = con.execute(
+            "SELECT id FROM scans WHERE root = ?", (root,)
+        ).fetchall()
+        for s in old_scans:
+            # Delete excluded_families BEFORE files (FK constraint)
+            con.execute(
+                "DELETE FROM excluded_families WHERE excluded_id IN "
+                "(SELECT id FROM files WHERE scan_id = ?)",
+                (s["id"],)
+            )
+            con.execute("DELETE FROM files WHERE scan_id = ?", (s["id"],))
+        con.execute("DELETE FROM scans WHERE root = ?", (root,))
+        con.commit()
+        print(f"[rescan] deleted existing scan rows for {root}", file=sys.stderr)
+
+    # Create scan record first so we can always mark finished_at on abort
+    started_at = time.time()
+    cur = con.execute(
+        "INSERT INTO scans (root, started_at, schema_version) VALUES (?, ?, 2)",
+        (root, started_at),
+    )
+    scan_id = cur.lastrowid
+    con.commit()
+
+    # Check free space before starting scan body
+    db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+    current_free = free_gib(db_dir)
+    if current_free < min_free:
+        con.execute(
+            "UPDATE scans SET finished_at=?, files_count=0, excluded_count=0, "
+            "bytes_logical=0, bytes_blocks=0 WHERE id=?",
+            (time.time(), scan_id),
+        )
+        con.commit()
+        print(
+            f"error: free disk below {min_free} GiB "
+            f"(currently {current_free:.2f} GiB), aborting scan",
+            file=sys.stderr,
+        )
+        sys.exit(EX_TEMPFAIL)
+
+    try:
+        root_stat = os.lstat(root)
+        root_dev = root_stat.st_dev
+    except OSError as e:
+        sys.exit(f"error: cannot stat root: {e}")
+
+    # Build exclude sets
+    single_excludes, multi_excludes = build_excludes(args)
+
+    total_files = 0
+    total_logical = 0
+    total_blocks = 0
+    total_excluded = 0
+    batch: list[tuple] = []
+
+    last_progress = time.time()
+    last_disk_check = time.time()
+    scan_start = time.time()
+    interrupted = False
+    disk_abort = False
+
+    def flush() -> None:
+        nonlocal batch
+        if batch:
+            con.executemany(_INSERT_FILE_SQL, batch)
+            con.commit()
+            batch = []
+
+    def handle_sigint(sig, frame) -> None:
+        nonlocal interrupted
+        interrupted = True
+
+    signal.signal(signal.SIGINT, handle_sigint)
+
+    # Insert root dir itself first to get its id
+    root_clone = None
+    if not args.no_clones:
+        try:
+            root_clone = get_clone_id(root)
+        except Exception:
+            pass
+
+    root_name = root  # Store full path as name for the root node (no parent)
+    root_dir_id = _insert_dir_get_id(
+        con,
+        parent_id=None,
+        name=root_name,
+        is_excluded=0,
+        dev=root_stat.st_dev,
+        ino=root_stat.st_ino,
+        clone_id=root_clone,
+        nlinks=root_stat.st_nlink,
+        size_logical=root_stat.st_size,
+        size_blocks=root_stat.st_blocks * 512,
+        excluded_file_count=None,
+        mtime=int(root_stat.st_mtime),
+        scan_id=scan_id,
+    )
+    con.commit()
+
+    # Stack entries: (parent_id, dir_path, rel_path_from_root)
+    dirs_to_visit: list[tuple[int, str, str]] = [(root_dir_id, root, "")]
+    permission_errors: set[str] = set()
+
+    while dirs_to_visit and not interrupted and not disk_abort:
+        parent_id, current_dir, rel_from_root = dirs_to_visit.pop()
+
+        try:
+            entries = list(os.scandir(current_dir))
+        except PermissionError:
+            if current_dir not in permission_errors:
+                print(f"error: permission denied: {current_dir}", file=sys.stderr)
+                permission_errors.add(current_dir)
+            continue
+        except OSError as e:
+            print(f"error: scandir {current_dir}: {e}", file=sys.stderr)
+            continue
+
+        for entry in entries:
+            if interrupted or disk_abort:
+                break
+
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+
+            if not args.cross_device and st.st_dev != root_dev:
+                continue
+
+            name = entry.name
+            is_dir = entry.is_dir(follow_symlinks=False)
+            is_symlink = entry.is_symlink()
+            dev = st.st_dev
+            ino = st.st_ino
+            nlinks = st.st_nlink
+            size_logical = st.st_size
+            size_blocks = st.st_blocks * 512
+            mtime = int(st.st_mtime)
+            entry_rel = (rel_from_root + "/" + name).lstrip("/") if rel_from_root else name
+
+            # Exclusion check (dirs only)
+            if is_dir and not is_symlink:
+                if is_excluded(name, entry_rel, single_excludes, multi_excludes):
+                    flush()
+                    agg_blocks, agg_logical, agg_count, clone_families = walk_for_aggregate(entry.path, root_dev)
+                    excl_id = _insert_dir_get_id(
+                        con,
+                        parent_id=parent_id,
+                        name=name,
+                        is_excluded=1,
+                        dev=dev,
+                        ino=ino,
+                        clone_id=None,
+                        nlinks=nlinks,
+                        size_logical=agg_logical,
+                        size_blocks=agg_blocks,
+                        excluded_file_count=agg_count,
+                        mtime=mtime,
+                        scan_id=scan_id,
+                    )
+                    # Insert clone family data for this excluded subtree
+                    for cid, (cnt, bsum, bmax) in clone_families.items():
+                        con.execute(
+                            "INSERT OR REPLACE INTO excluded_families "
+                            "(excluded_id, clone_id, member_count, blocks_sum, max_blocks) "
+                            "VALUES (?,?,?,?,?)",
+                            (excl_id, cid, cnt, bsum, bmax),
+                        )
+                    con.commit()
+                    total_excluded += 1
+                    continue  # don't recurse
+
+            clone_id = None
+            if not args.no_clones and not is_symlink:
+                try:
+                    clone_id = get_clone_id(entry.path)
+                except Exception:
+                    pass
+
+            if is_dir and not is_symlink:
+                # Insert dir, get its id, then recurse
+                flush()
+                new_id = _insert_dir_get_id(
+                    con,
+                    parent_id=parent_id,
+                    name=name,
+                    is_excluded=0,
+                    dev=dev,
+                    ino=ino,
+                    clone_id=clone_id,
+                    nlinks=nlinks,
+                    size_logical=size_logical,
+                    size_blocks=size_blocks,
+                    excluded_file_count=None,
+                    mtime=mtime,
+                    scan_id=scan_id,
+                )
+                con.commit()
+                dirs_to_visit.append((new_id, entry.path, entry_rel))
+            else:
+                # Leaf file or symlink — batch insert
+                batch.append((
+                    parent_id, name,
+                    0,  # is_dir
+                    1 if is_symlink else 0,
+                    0,  # is_excluded
+                    dev, ino, clone_id,
+                    nlinks, size_logical, size_blocks,
+                    None,  # excluded_file_count
+                    mtime, scan_id,
+                ))
+
+                total_files += 1
+                total_logical += size_logical
+                total_blocks += size_blocks
+
+                if len(batch) >= _BATCH_SIZE:
+                    flush()
+
+            now = time.time()
+
+            # Progress
+            if not args.quiet and now - last_progress >= _PROGRESS_INTERVAL:
+                elapsed = now - scan_start
+                rate = total_files / elapsed if elapsed > 0 else 0
+                print(
+                    f"[{total_files:,} files, {total_excluded} excluded, "
+                    f"{fmt_bytes(total_blocks)} scanned, {rate:.0f} files/sec]",
+                    file=sys.stderr,
+                )
+                last_progress = now
+
+            # Disk safety check
+            if now - last_disk_check >= _DISK_CHECK_INTERVAL:
+                current_free = free_gib(db_dir)
+                if current_free < min_free:
+                    print(
+                        f"error: free disk below {min_free} GiB "
+                        f"(currently {current_free:.2f} GiB), aborting scan",
+                        file=sys.stderr,
+                    )
+                    disk_abort = True
+                last_disk_check = now
+
+    flush()
+
+    # Update scan record
+    con.execute(
+        "UPDATE scans SET finished_at=?, files_count=?, excluded_count=?, "
+        "bytes_logical=?, bytes_blocks=? WHERE id=?",
+        (time.time(), total_files, total_excluded, total_logical, total_blocks, scan_id),
+    )
+    con.commit()
+
+    # Invalidate freeable cache: scan data changed, and scan_id may be reused
+    # (SQLite reuses rowids after --rescan deletes the old scans row), so
+    # stale freeable_cache rows would otherwise look valid.
+    try:
+        con.execute("DELETE FROM freeable_cache")
+        con.commit()
+        print("[scan] freeable cache invalidated", file=sys.stderr)
+    except sqlite3.OperationalError:
+        pass  # table doesn't exist yet (no freeable run since DB creation)
+
+    if disk_abort:
+        sys.exit(EX_TEMPFAIL)
+
+    if interrupted:
+        print(f"\n[interrupted] partial scan committed: {total_files:,} files", file=sys.stderr)
+        sys.exit(130)
+
+    elapsed = time.time() - started_at
+    rate = total_files / elapsed if elapsed > 0 else 0
+    if not args.quiet:
+        print(
+            f"Scan complete: {total_files:,} files, {total_excluded} excluded dirs "
+            f"in {elapsed:.1f}s ({rate:.0f} files/sec)\n"
+            f"  logical: {fmt_bytes(total_logical)}  blocks: {fmt_bytes(total_blocks)}\n"
+            f"  DB: {DB_PATH}",
+            file=sys.stderr,
+        )
+
+
+# ---------------------------------------------------------------------------
+# TOP subcommand
+# ---------------------------------------------------------------------------
+def cmd_top(args: argparse.Namespace) -> None:
+    con = open_db_for_read()
+    _init_schema(con)
+
+    under = args.under
+    depth = args.depth
+    limit = args.limit
+    by = args.by
+
+    if under:
+        under = os.path.realpath(under)
+        root_id = resolve_path_to_id(con, under)
+        if root_id is None:
+            sys.exit(f"error: path not found in DB: {under}\nRun `dskdb scan` first.")
+    else:
+        scan = con.execute("SELECT root FROM scans ORDER BY id DESC LIMIT 1").fetchone()
+        if not scan:
+            sys.exit("error: no scans found. Run `dskdb scan <path>` first.")
+        under = scan["root"]
+        root_id = resolve_path_to_id(con, under)
+        if root_id is None:
+            sys.exit(f"error: root not found in DB: {under}")
+
+    # Strategy: Two-phase approach.
+    # Phase 1: Find bucket nodes = direct descendants at exactly `depth` levels from root,
+    #          OR shallower nodes that are leaves (no children) or excluded dirs.
+    # Phase 2: For each bucket, sum all descendant file sizes.
+    #
+    # We use a recursive CTE that:
+    #   - Propagates bucket_id (frozen at depth from root)
+    #   - Recurses to all leaves (no depth cap on recursion)
+    #   - Skips further recursion into excluded dirs (they're aggregates)
+    sql = """
+    WITH RECURSIVE
+    tree(id, is_dir, is_excluded, size_blocks, size_logical, clone_id,
+         excluded_file_count, cur_depth, bucket_id) AS (
+      -- Seed: direct children of root_id at depth=1
+      SELECT f.id, f.is_dir, f.is_excluded,
+             f.size_blocks, f.size_logical, f.clone_id, f.excluded_file_count,
+             1 AS cur_depth,
+             f.id AS bucket_id
+      FROM files f WHERE f.parent_id = :root_id
+      UNION ALL
+      SELECT f.id, f.is_dir, f.is_excluded,
+             f.size_blocks, f.size_logical, f.clone_id, f.excluded_file_count,
+             t.cur_depth + 1,
+             -- once we've gone `depth` levels deep, freeze the bucket_id
+             CASE WHEN t.cur_depth >= :depth THEN t.bucket_id ELSE f.id END
+      FROM files f JOIN tree t ON f.parent_id = t.id
+      WHERE t.is_excluded = 0   -- excluded dirs are leaf aggregates, don't recurse
+        AND t.is_dir = 1        -- only recurse into directories
+    ),
+    multi_clones(clone_id) AS (
+      SELECT clone_id FROM files WHERE clone_id IS NOT NULL
+      GROUP BY clone_id HAVING COUNT(*) > 1
+    )
+    SELECT
+      bucket_id,
+      SUM(CASE WHEN is_dir = 0 OR is_excluded = 1 THEN size_blocks ELSE 0 END) AS total_blocks,
+      SUM(CASE WHEN is_dir = 0 OR is_excluded = 1 THEN size_logical ELSE 0 END) AS total_logical,
+      SUM(CASE WHEN is_dir = 0 THEN 1
+               WHEN is_excluded = 1 THEN COALESCE(excluded_file_count, 0)
+               ELSE 0 END) AS file_count,
+      SUM(CASE WHEN clone_id IS NOT NULL
+                    AND clone_id IN (SELECT clone_id FROM multi_clones)
+                    AND is_dir = 0
+               THEN size_blocks ELSE 0 END) AS clone_blocks
+    FROM tree
+    GROUP BY bucket_id
+    ORDER BY
+      CASE :sort_by
+        WHEN 'logical' THEN SUM(CASE WHEN is_dir = 0 OR is_excluded = 1 THEN size_logical ELSE 0 END)
+        ELSE SUM(CASE WHEN is_dir = 0 OR is_excluded = 1 THEN size_blocks ELSE 0 END)
+      END DESC
+    LIMIT :limit
+    """
+
+    rows = con.execute(sql, {
+        "root_id":   root_id,
+        "depth":     depth,
+        "sort_by":   by,
+        "limit":     limit,
+    }).fetchall()
+
+    if not rows:
+        print("(no data)")
+        return
+
+    # Resolve bucket paths
+    bucket_paths = []
+    for r in rows:
+        p = full_path(con, r["bucket_id"])
+        bucket_paths.append(p)
+
+    home = os.path.expanduser("~")
+    names = [os.path.basename(p) or p for p in bucket_paths]
+    reals = [fmt_bytes(r["total_blocks"]) for r in rows]
+    apparents = [fmt_bytes_highlight(r["total_blocks"], r["total_logical"]) for r in rows]
+    counts = [str(r["file_count"]) for r in rows]
+
+    if args.json:
+        out = []
+        for path, name, r in zip(bucket_paths, names, rows):
+            out.append({
+                "path":        path,
+                "name":        name,
+                "blocks":      r["total_blocks"],
+                "logical":     r["total_logical"],
+                "clone_blocks": r["clone_blocks"],
+                "file_count":  r["file_count"],
+            })
+        print(json.dumps(out, indent=2))
+        return
+
+    w_name  = col_width(names, "NAME")
+    w_real  = col_width(reals, "REAL")
+    w_appar = col_width(apparents, "APPARENT")
+    w_count = col_width(counts, "FILES")
+
+    header = (
+        f"{'NAME':<{w_name}}  {'REAL':>{w_real}}  {'APPARENT':>{w_appar}}  {'FILES':>{w_count}}"
+    )
+    print(header)
+    print("-" * len(header))
+    for name, real, appar, count in zip(names, reals, apparents, counts):
+        print(f"{name:<{w_name}}  {real:>{w_real}}  {appar:>{w_appar}}  {count:>{w_count}}")
+
+
+# ---------------------------------------------------------------------------
+# MARGINAL helpers (family-once semantics)
+# ---------------------------------------------------------------------------
+
+def _compute_marginal_freeable(con: sqlite3.Connection, root_id: int) -> dict:
+    """
+    Compute strict freeable bytes for a subtree using family-once semantics.
+    - Clone family fully inside target: credit max(member blocks) once.
+    - Hardlink family fully inside target: credit inode blocks once.
+    - Singleton: credit blocks.
+    Uses SQL for efficiency; no per-family Python loops over large datasets.
+    Returns dict with strict_bytes, apparent_bytes, total_blocks, file_count, dir_count.
+    """
+    cte_sql, cte_params = descendant_ids_cte(root_id)
+
+    # --- Counts (apparent, total_blocks, file_count, dir_count) ---
+    counts_sql = cte_sql + """
+    SELECT
+      SUM(CASE WHEN f.is_dir=0 THEN 1 ELSE 0 END) AS file_count,
+      SUM(CASE WHEN f.is_dir=1 AND f.is_excluded=0 THEN 1 ELSE 0 END) AS dir_count,
+      SUM(CASE WHEN f.is_dir=0 THEN f.size_logical
+               WHEN f.is_excluded=1 THEN f.size_logical ELSE 0 END) AS apparent,
+      SUM(CASE WHEN f.is_dir=0 THEN f.size_blocks
+               WHEN f.is_excluded=1 THEN f.size_blocks ELSE 0 END) AS total_blocks
+    FROM files f JOIN desc_ids d ON f.id = d.id
+    """
+    counts = con.execute(counts_sql, cte_params).fetchone()
+
+    # --- Strict freeable via SQL ---
+    # Strategy: use a single SQL pass that identifies which families are
+    # fully inside the target, then sums their credit.
+    #
+    # For clone families: family is fully inside if every member is in desc_ids.
+    # Credit: MAX(size_blocks) per clone family.
+    # For hardlink families: family is fully inside if inside_count == nlinks.
+    # Credit: size_blocks once (any member — all same inode).
+    # Singletons: their own size_blocks.
+    #
+    # Implementation: compute inside_count per family, total_count per family,
+    # then filter for fully-inside families.
+
+    # We use a Python-side approach for efficiency:
+    # 1. Load inside_files in one CTE query
+    # 2. Batch-fetch global clone counts for clone_ids present inside
+    # 3. Batch-fetch global hl counts for (dev,ino) pairs present inside
+
+    inside_sql = cte_sql + """
+    SELECT f.id, f.dev, f.ino, f.clone_id, f.nlinks, f.size_blocks
+    FROM files f JOIN desc_ids d ON f.id = d.id
+    WHERE f.is_dir = 0
+    """
+    inside_rows = con.execute(inside_sql, cte_params).fetchall()
+
+    # Group inside files
+    clone_inside: dict[int, list] = collections.defaultdict(list)  # clone_id -> [size_blocks,...]
+    hl_inside: dict[tuple, tuple] = {}   # (dev,ino) -> (inside_cnt, nlinks, blocks)
+    singleton_blocks = 0
+
+    for r in inside_rows:
+        cid = r["clone_id"]
+        if cid is not None:
+            clone_inside[cid].append(r["size_blocks"])
+        elif r["nlinks"] > 1:
+            key = (r["dev"], r["ino"])
+            if key not in hl_inside:
+                hl_inside[key] = [1, r["nlinks"], r["size_blocks"]]
+            else:
+                hl_inside[key][0] += 1
+        else:
+            singleton_blocks += r["size_blocks"]
+
+    # Get global clone counts for clone_ids seen inside the subtree.
+    # Use batched IN queries (avoids temp table which needs write access).
+    clone_strict = 0
+    if clone_inside:
+        clone_ids_list = list(clone_inside.keys())
+        global_clone_map: dict[int, int] = {}
+        # Batch in chunks of 500 to keep query size manageable
+        _BATCH = 500
+        for i in range(0, len(clone_ids_list), _BATCH):
+            batch = clone_ids_list[i:i + _BATCH]
+            placeholders = ",".join("?" * len(batch))
+            rows_g = con.execute(
+                f"SELECT clone_id, COUNT(*) AS cnt FROM files "
+                f"WHERE clone_id IN ({placeholders}) GROUP BY clone_id",
+                batch,
+            ).fetchall()
+            for rg in rows_g:
+                global_clone_map[rg["clone_id"]] = rg["cnt"]
+
+        for cid, blocks_list in clone_inside.items():
+            inside_cnt = len(blocks_list)
+            total_cnt = global_clone_map.get(cid, inside_cnt)
+            if inside_cnt >= total_cnt:
+                clone_strict += max(blocks_list)
+
+    # Hardlink families
+    hl_strict = 0
+    for (dev, ino), (inside_cnt, nlinks, blocks) in hl_inside.items():
+        if inside_cnt >= nlinks:
+            hl_strict += blocks
+
+    strict_blocks = clone_strict + hl_strict + singleton_blocks
+
+    return {
+        "strict_bytes": int(strict_blocks),
+        "apparent_bytes": int(counts["apparent"] or 0),
+        "total_blocks": int(counts["total_blocks"] or 0),
+        "file_count": int(counts["file_count"] or 0),
+        "dir_count": int(counts["dir_count"] or 0),
+    }
+
+
+# ---------------------------------------------------------------------------
+# MARGINAL subcommand
+# ---------------------------------------------------------------------------
+def cmd_marginal(args: argparse.Namespace) -> None:
+    path = os.path.realpath(args.path)
+    con = open_db_for_read()
+    _init_schema(con)
+
+    root_id = resolve_path_to_id(con, path)
+    if root_id is None:
+        sys.exit(f"error: no data for path {path} — run `dskdb scan` first")
+
+    result = _compute_marginal_freeable(con, root_id)
+    strict_blocks    = result["strict_bytes"]
+    total_apparent   = result["apparent_bytes"]
+    total_blocks_all = result["total_blocks"]
+    total_files      = result["file_count"]
+    total_dirs       = result["dir_count"]
+
+    # External leaks (top 5): files/families with members outside the target.
+    # Use the already-computed result data from _compute_marginal_freeable.
+    # We need to re-run the inside query to find files with external family members.
+    # This is a fast Python-side computation reusing cached data.
+    cte_sql, cte_params = descendant_ids_cte(root_id)
+    inside_sql_leaks = cte_sql + """
+    SELECT f.id, f.dev, f.ino, f.clone_id, f.nlinks, f.size_blocks
+    FROM files f JOIN desc_ids d ON f.id = d.id
+    WHERE f.is_dir = 0
+    """
+    inside_files_leaks = con.execute(inside_sql_leaks, cte_params).fetchall()
+    inside_id_set = {r["id"] for r in inside_files_leaks}
+
+    # Build family groups from inside files
+    clone_grp_leaks: dict = collections.defaultdict(list)
+    hl_grp_leaks: dict = collections.defaultdict(list)
+    for r in inside_files_leaks:
+        if r["clone_id"] is not None:
+            clone_grp_leaks[r["clone_id"]].append(r)
+        elif r["nlinks"] > 1:
+            hl_grp_leaks[(r["dev"], r["ino"])].append(r)
+
+    # Get global counts (batched)
+    leak_clone_global: dict = {}
+    if clone_grp_leaks:
+        cids = list(clone_grp_leaks.keys())
+        for i in range(0, len(cids), 500):
+            batch = cids[i:i+500]
+            phs = ",".join("?" * len(batch))
+            for rg in con.execute(
+                f"SELECT clone_id, COUNT(*) AS cnt FROM files "
+                f"WHERE clone_id IN ({phs}) GROUP BY clone_id", batch
+            ).fetchall():
+                leak_clone_global[rg["clone_id"]] = rg["cnt"]
+
+    # Collect leak candidates: families with members outside
+    leak_candidates = []
+    for cid, members in clone_grp_leaks.items():
+        inside_cnt = len(members)
+        total_cnt = leak_clone_global.get(cid, inside_cnt)
+        if inside_cnt < total_cnt:
+            # Some members outside — compute approximate blocks held outside
+            max_blk = max(r["size_blocks"] for r in members)
+            frac_outside = (total_cnt - inside_cnt) / total_cnt
+            leak_candidates.append((
+                members[0]["id"], max_blk * frac_outside,
+                cid, None, None, members[0]["nlinks"]
+            ))
+    for (dev, ino), members in hl_grp_leaks.items():
+        nlinks = members[0]["nlinks"]
+        inside_cnt = len(members)
+        if inside_cnt < nlinks:
+            blk = members[0]["size_blocks"]
+            frac_outside = (nlinks - inside_cnt) / nlinks
+            leak_candidates.append((
+                members[0]["id"], blk * frac_outside,
+                None, dev, ino, nlinks
+            ))
+
+    leak_candidates.sort(key=lambda x: x[1], reverse=True)
+    leak_rows = leak_candidates[:5]
+
+    if args.json:
+        out = {
+            "path": path,
+            "freeable_bytes": strict_blocks,
+            "strict_marginal_bytes": strict_blocks,  # backward compat alias
+            "apparent_bytes": total_apparent,
+            "total_blocks_bytes": total_blocks_all,
+            "file_count": total_files,
+            "dir_count": total_dirs,
+        }
+        print(json.dumps(out, indent=2))
+        return
+
+    print(f"Marginal disk cost: {path}")
+    print("  (family-once semantics: clone families count max(blocks) once, not per-member sum)")
+    print()
+    w = 24
+    print(f"  {'Freeable (strict):':{w}} {fmt_bytes(strict_blocks):>12}  (what rm -rf returns to df)")
+    print(f"  {'Apparent (du-style):':{w}} {fmt_bytes(total_apparent):>12}")
+    print(f"  {'On-disk blocks:':{w}} {fmt_bytes(total_blocks_all):>12}")
+    print(f"  {'Files:':{w}} {total_files:>12,}")
+    print(f"  {'Dirs:':{w}} {total_dirs:>12,}")
+
+    if leak_rows:
+        print()
+        print("  Blocks shared with paths OUTSIDE this directory (top 5):")
+        home = os.path.expanduser("~")
+        for (fid, blocks_ext, clone_id, dev, ino, nlinks) in leak_rows:
+            fpath = full_path(con, fid)
+            short_fpath = fpath.replace(home, "~")
+
+            if clone_id is not None:
+                ext_rows = con.execute(
+                    "SELECT id FROM files WHERE clone_id = ? AND id NOT IN (?)",
+                    (clone_id, ",".join(str(x) for x in inside_id_set)),
+                ).fetchall()
+                # Simplified: just show the clone_id family dirs
+                ext_rows = con.execute(
+                    "SELECT id FROM files WHERE clone_id = ? AND id != ?",
+                    (clone_id, fid),
+                ).fetchall()
+                ext_ids = {r["id"] for r in ext_rows} - inside_id_set
+                ext_rows_f = [{"id": eid} for eid in list(ext_ids)[:10]]
+            else:
+                ext_rows_f = con.execute(
+                    "SELECT id FROM files WHERE dev = ? AND ino = ? AND nlinks > 1 AND id != ?",
+                    (dev, ino, fid),
+                ).fetchall()
+                ext_rows_f = [r for r in ext_rows_f if r["id"] not in inside_id_set]
+
+            ext_dirs = sorted({
+                os.path.dirname(full_path(con, r["id"])).replace(home, "~")
+                for r in ext_rows_f[:5]
+            })
+            ext_summary = ", ".join(ext_dirs[:2])
+            print(f"    {fmt_bytes(int(blocks_ext)):>10}  {short_fpath}  → {ext_summary}")
+
+
+# ---------------------------------------------------------------------------
+# FILE subcommand
+# ---------------------------------------------------------------------------
+def cmd_file(args: argparse.Namespace) -> None:
+    path = os.path.realpath(args.path)
+    con = open_db_for_read()
+    _init_schema(con)
+
+    file_id = resolve_path_to_id(con, path)
+    if file_id is None:
+        sys.exit(f"error: file not in DB: {path}\nRun `dskdb scan` on the containing directory first.")
+
+    row = con.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
+    if not row:
+        sys.exit(f"error: file not in DB: {path}")
+
+    print(f"File: {path}")
+    print(f"  size_logical:  {fmt_bytes(row['size_logical'])} ({row['size_logical']:,} bytes)")
+    print(f"  size_blocks:   {fmt_bytes(row['size_blocks'])} ({row['size_blocks']:,} bytes)")
+    print(f"  inode:         {row['ino']}  dev={row['dev']}")
+    print(f"  nlinks:        {row['nlinks']}")
+    print(f"  clone_id:      {row['clone_id']}")
+    print(f"  mtime:         {time.ctime(row['mtime'])}")
+    if row["is_excluded"]:
+        print(f"  [EXCLUDED DIR: {row['excluded_file_count']} files, aggregate sizes above]")
+
+    if row["clone_id"] is not None:
+        family = con.execute(
+            "SELECT id FROM files WHERE clone_id = ? AND id != ?",
+            (row["clone_id"], file_id),
+        ).fetchall()
+        if family:
+            print(f"\n  Clone family ({len(family)} other members):")
+            home = os.path.expanduser("~")
+            for m in family[:10]:
+                short = full_path(con, m["id"]).replace(home, "~")
+                print(f"    {short}")
+            if len(family) > 10:
+                print(f"    ... and {len(family) - 10} more")
+
+    if row["nlinks"] > 1:
+        hl_family = con.execute(
+            "SELECT id FROM files WHERE dev=? AND ino=? AND id != ?",
+            (row["dev"], row["ino"], file_id),
+        ).fetchall()
+        if hl_family:
+            print(f"\n  Hardlink family ({len(hl_family)} other members):")
+            home = os.path.expanduser("~")
+            for m in hl_family[:10]:
+                short = full_path(con, m["id"]).replace(home, "~")
+                print(f"    {short}")
+            if len(hl_family) > 10:
+                print(f"    ... and {len(hl_family) - 10} more")
+
+
+# ---------------------------------------------------------------------------
+# CLONES subcommand
+# ---------------------------------------------------------------------------
+def cmd_clones(args: argparse.Namespace) -> None:
+    con = open_db_for_read()
+    _init_schema(con)
+
+    under = args.under
+    min_bytes = args.min_bytes
+    limit = args.limit
+
+    if under:
+        under = os.path.realpath(under)
+        root_id = resolve_path_to_id(con, under)
+        if root_id is None:
+            sys.exit(f"error: path not found in DB: {under}")
+
+        cte_sql, cte_params = descendant_ids_cte(root_id)
+        query = cte_sql + """
+        SELECT clone_id, id, size_blocks FROM files
+        WHERE clone_id IS NOT NULL AND id IN (SELECT id FROM desc_ids)
+        """
+        rows = con.execute(query, cte_params).fetchall()
+    else:
+        rows = con.execute(
+            "SELECT clone_id, id, size_blocks FROM files WHERE clone_id IS NOT NULL"
+        ).fetchall()
+
+    from collections import defaultdict
+    fam_blocks: dict[int, int] = defaultdict(int)
+    fam_count: dict[int, int] = defaultdict(int)
+    fam_ids: dict[int, list[int]] = defaultdict(list)
+
+    for r in rows:
+        cid = r["clone_id"]
+        fam_blocks[cid] += r["size_blocks"]
+        fam_count[cid] += 1
+        fam_ids[cid].append(r["id"])
+
+    families = [
+        (cid, fam_count[cid], fam_blocks[cid], fam_ids[cid])
+        for cid in fam_blocks
+        if fam_count[cid] > 1 and fam_blocks[cid] >= min_bytes
+    ]
+    families.sort(key=lambda x: (x[2] // x[1]) * max(x[1] - 1, 0), reverse=True)
+    families = families[:limit]
+
+    if not families:
+        print("(no clone families found)")
+        return
+
+    home = os.path.expanduser("~")
+
+    if args.json:
+        out = []
+        for cid, count, blocks, ids in families:
+            sample_paths = [full_path(con, i).replace(home, "~") for i in ids[:3]]
+            out.append({
+                "clone_id": cid,
+                "member_count": count,
+                "blocks_each": blocks // count if count else 0,
+                "blocks_total": blocks,
+                "waste_bytes": blocks * max(count - 1, 0),
+                "sample_paths": sample_paths,
+            })
+        print(json.dumps(out, indent=2))
+        return
+
+    print(f"{'CLONE_ID':<18}  {'COUNT':>5}  {'BLOCKS_EACH':>12}  {'WASTE':>12}  PATHS (sample)")
+    print("-" * 90)
+    for cid, count, blocks, ids in families:
+        each = blocks // count if count else 0
+        waste = each * max(count - 1, 0)
+        sample = [full_path(con, i).replace(home, "~") for i in ids[:3]]
+        print(f"{cid:<18}  {count:>5}  {fmt_bytes(each):>12}  {fmt_bytes(waste):>12}  {sample[0]}")
+        for p in sample[1:]:
+            print(f"{'':18}  {'':>5}  {'':>12}  {'':>12}  {p}")
+
+
+# ---------------------------------------------------------------------------
+# EXCLUDED subcommand (NEW)
+# ---------------------------------------------------------------------------
+def cmd_excluded(args: argparse.Namespace) -> None:
+    con = open_db_for_read()
+    _init_schema(con)
+
+    limit = args.limit
+    rows = con.execute(
+        "SELECT id, size_blocks, size_logical, excluded_file_count "
+        "FROM files WHERE is_excluded = 1 "
+        "ORDER BY size_blocks DESC "
+        "LIMIT ?",
+        (limit,),
+    ).fetchall()
+
+    if not rows:
+        print("(no excluded directories found)")
+        return
+
+    home = os.path.expanduser("~")
+    paths = [full_path(con, r["id"]).replace(home, "~") for r in rows]
+    blocks_strs = [fmt_bytes(r["size_blocks"]) for r in rows]
+    files_strs = [str(r["excluded_file_count"] or 0) for r in rows]
+
+    ranks = [str(i + 1) for i in range(len(rows))]
+    w_rank   = col_width(ranks, "RANK")
+    w_blocks = col_width(blocks_strs, "BLOCKS")
+    w_files  = col_width(files_strs, "FILES")
+    w_path   = col_width(paths, "PATH")
+
+    header = (
+        f"{'RANK':>{w_rank}}  {'BLOCKS':>{w_blocks}}  {'FILES':>{w_files}}  {'PATH':<{w_path}}"
+    )
+    print(header)
+    print("-" * len(header))
+    for rank, blk, files, path in zip(ranks, blocks_strs, files_strs, paths):
+        print(f"{rank:>{w_rank}}  {blk:>{w_blocks}}  {files:>{w_files}}  {path:<{w_path}}")
+
+
+# ---------------------------------------------------------------------------
+# SQL subcommand
+# ---------------------------------------------------------------------------
+_VIEWS_SQL = """
+CREATE TEMP VIEW IF NOT EXISTS v_dir_real AS
+  SELECT f.parent_id,
+         SUM(f.size_blocks) AS blocks_total,
+         COUNT(*) AS file_count
+  FROM files f
+  WHERE f.is_dir = 0
+  GROUP BY f.parent_id;
+
+CREATE TEMP VIEW IF NOT EXISTS v_clone_families AS
+  SELECT clone_id,
+         COUNT(*) AS member_count,
+         SUM(size_blocks) AS blocks,
+         MIN(id) AS sample_id
+  FROM files
+  WHERE clone_id IS NOT NULL
+  GROUP BY clone_id;
+
+CREATE TEMP VIEW IF NOT EXISTS v_hardlink_families AS
+  SELECT dev, ino,
+         COUNT(*) AS nlinks_in_db,
+         MIN(size_blocks) AS blocks,
+         MIN(id) AS sample_id
+  FROM files
+  WHERE nlinks > 1
+  GROUP BY dev, ino;
+
+CREATE TEMP VIEW IF NOT EXISTS v_excluded AS
+  SELECT id, size_blocks, size_logical, excluded_file_count
+  FROM files WHERE is_excluded = 1
+  ORDER BY size_blocks DESC;
+"""
+
+
+def cmd_sql(_args: argparse.Namespace) -> None:
+    db_path = DB_PATH
+    if not os.path.exists(db_path):
+        sys.exit(f"error: DB not found: {db_path}\nRun `dskdb scan <path>` first.")
+
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".sql", delete=False, prefix="dskdb-init-") as f:
+        f.write(_VIEWS_SQL)
+        init_file = f.name
+
+    try:
+        subprocess.run(["sqlite3", "-init", init_file, db_path], check=False)
+    finally:
+        os.unlink(init_file)
+
+
+# ---------------------------------------------------------------------------
+# STATS subcommand
+# ---------------------------------------------------------------------------
+def cmd_stats(_args: argparse.Namespace) -> None:
+    con = open_db_for_read()
+    _init_schema(con)
+
+    scan = con.execute(
+        "SELECT * FROM scans ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if not scan:
+        print("No scans found. Run `dskdb scan <path>` first.")
+        return
+
+    print("=== dskdb stats (v2) ===")
+    print()
+    print(f"  Last scan root:    {scan['root']}")
+    scanned_at = time.ctime(scan["started_at"])
+    elapsed = ""
+    if scan["finished_at"]:
+        elapsed = f"  (took {scan['finished_at'] - scan['started_at']:.1f}s)"
+    print(f"  Scanned at:        {scanned_at}{elapsed}")
+    print(f"  Files in scan:     {scan['files_count']:,}" if scan["files_count"] else "  Files in scan:     (in progress)")
+    print(f"  Excluded dirs:     {scan['excluded_count'] or 0:,}")
+    if scan["bytes_logical"]:
+        print(f"  Logical size:      {fmt_bytes(scan['bytes_logical'])}")
+    if scan["bytes_blocks"]:
+        print(f"  Block usage:       {fmt_bytes(scan['bytes_blocks'])}")
+
+    print()
+    totals = con.execute(
+        "SELECT COUNT(*) AS cnt, SUM(size_logical) AS log, SUM(size_blocks) AS blk "
+        "FROM files WHERE is_dir = 0"
+    ).fetchone()
+    print(f"  Total files in DB:     {totals['cnt']:,}")
+    if totals["log"]:
+        print(f"  Total logical:         {fmt_bytes(totals['log'])}")
+    if totals["blk"]:
+        print(f"  Total blocks:          {fmt_bytes(totals['blk'])}")
+
+    excl_totals = con.execute(
+        "SELECT COUNT(*) AS cnt, SUM(excluded_file_count) AS fc, SUM(size_blocks) AS blk "
+        "FROM files WHERE is_excluded = 1"
+    ).fetchone()
+    if excl_totals["cnt"]:
+        print(f"  Excluded subtrees:     {excl_totals['cnt']:,}  "
+              f"({excl_totals['fc'] or 0:,} files, {fmt_bytes(excl_totals['blk'] or 0)})")
+
+    clone_info = con.execute(
+        "SELECT COUNT(*) AS families, SUM(cnt) AS files FROM ("
+        "  SELECT clone_id, COUNT(*) AS cnt FROM files WHERE clone_id IS NOT NULL"
+        "  GROUP BY clone_id HAVING cnt > 1"
+        ")"
+    ).fetchone()
+    print(f"  Clone families (>1):   {clone_info['families'] or 0:,}  ({clone_info['files'] or 0:,} files)")
+
+    hl_info = con.execute(
+        "SELECT COUNT(DISTINCT dev || ':' || ino) AS families, COUNT(*) AS files "
+        "FROM files WHERE nlinks > 1"
+    ).fetchone()
+    print(f"  Hardlink families:     {hl_info['families']:,}  ({hl_info['files']:,} files)")
+
+    print()
+    print("  Top 5 directories by block usage:")
+    top_dirs = con.execute(
+        "SELECT parent_id, SUM(size_blocks) AS blk, COUNT(*) AS cnt "
+        "FROM files WHERE is_dir = 0 AND parent_id IS NOT NULL "
+        "GROUP BY parent_id ORDER BY blk DESC LIMIT 5"
+    ).fetchall()
+    home = os.path.expanduser("~")
+    for d in top_dirs:
+        try:
+            short = full_path(con, d["parent_id"]).replace(home, "~")
+        except Exception:
+            short = f"(id={d['parent_id']})"
+        print(f"    {fmt_bytes(d['blk']):>12}  {d['cnt']:>6} files  {short}")
+
+
+# ---------------------------------------------------------------------------
+# FREEABLE computation (LCA-based, family-once semantics) — streaming/array version
+# ---------------------------------------------------------------------------
+
+def _lca_arr(node_a: int, node_b: int, depth_arr: array.array, parent_arr: array.array,
+             max_id: int) -> int:
+    """Compute LCA of two nodes using dense arrays. Returns -1 if no common ancestor."""
+    a, b = node_a, node_b
+    if a < 0 or a > max_id or b < 0 or b > max_id:
+        return -1
+    da = depth_arr[a]
+    db = depth_arr[b]
+    if da < 0 or db < 0:
+        return -1
+    while da > db:
+        a = parent_arr[a]
+        if a < 0:
+            return -1
+        da -= 1
+    while db > da:
+        b = parent_arr[b]
+        if b < 0:
+            return -1
+        db -= 1
+    while a != b:
+        pa = parent_arr[a]
+        pb = parent_arr[b]
+        if pa < 0 and pb < 0:
+            return -1
+        a = pa if pa >= 0 else a
+        b = pb if pb >= 0 else b
+    return a
+
+
+def _direct_child_of_arr(ancestor_id: int, descendant_id: int,
+                          parent_arr: array.array) -> int:
+    """Find the direct child of ancestor_id on the path to descendant_id."""
+    cur = descendant_id
+    while True:
+        p = parent_arr[cur]
+        if p < 0 or p == ancestor_id:
+            return cur
+        cur = p
+
+
+def _get_latest_scan_id(con: sqlite3.Connection) -> int | None:
+    row = con.execute("SELECT id FROM scans ORDER BY id DESC LIMIT 1").fetchone()
+    return row[0] if row else None
+
+
+def _load_freeable_cache(con: sqlite3.Connection, scan_id: int) -> tuple[dict, dict] | None:
+    """Try to load freeable results from cache. Returns (freeable, locked_here) or None."""
+    try:
+        row = con.execute(
+            "SELECT COUNT(*) AS cnt FROM freeable_cache WHERE scan_id = ?", (scan_id,)
+        ).fetchone()
+        if not row or row[0] == 0:
+            return None
+        print(f"[freeable] loading from cache (scan_id={scan_id})...", file=sys.stderr)
+        t0 = time.time()
+        freeable: dict[int, int] = {}
+        locked_here: dict[int, int] = {}
+        for r in con.execute(
+            "SELECT node_id, freeable, locked_here FROM freeable_cache WHERE scan_id = ?",
+            (scan_id,)
+        ):
+            nid = r[0]
+            if r[1]:
+                freeable[nid] = r[1]
+            if r[2]:
+                locked_here[nid] = r[2]
+        print(
+            f"[freeable] cache loaded: {len(freeable):,} freeable, "
+            f"{len(locked_here):,} locked_here in {time.time()-t0:.1f}s",
+            file=sys.stderr
+        )
+        return freeable, locked_here
+    except sqlite3.OperationalError:
+        return None
+
+
+def _persist_freeable_cache(
+    db_path: str,
+    scan_id: int,
+    freeable: dict,
+    locked_here: dict,
+) -> None:
+    """Write freeable results to cache table in a separate writable connection."""
+    try:
+        wcon = sqlite3.connect(db_path, timeout=30)
+        wcon.execute("PRAGMA journal_mode = WAL")
+        wcon.execute("PRAGMA synchronous = NORMAL")
+        wcon.executescript("""
+        CREATE TABLE IF NOT EXISTS freeable_cache (
+          node_id INTEGER PRIMARY KEY,
+          freeable INTEGER NOT NULL,
+          locked_here INTEGER NOT NULL,
+          scan_id INTEGER NOT NULL
+        );
+        """)
+        # Clear stale cache rows (different scan_id)
+        wcon.execute("DELETE FROM freeable_cache WHERE scan_id != ?", (scan_id,))
+
+        # Merge freeable and locked_here into rows (only non-zero)
+        all_ids = set(freeable.keys()) | set(locked_here.keys())
+        batch = []
+        for nid in all_ids:
+            f = freeable.get(nid, 0)
+            lh = locked_here.get(nid, 0)
+            if f or lh:
+                batch.append((nid, f, lh, scan_id))
+        # Insert in chunks
+        chunk = 10000
+        for i in range(0, len(batch), chunk):
+            wcon.executemany(
+                "INSERT OR REPLACE INTO freeable_cache (node_id, freeable, locked_here, scan_id) "
+                "VALUES (?,?,?,?)",
+                batch[i:i+chunk],
+            )
+        wcon.commit()
+        wcon.close()
+        print(
+            f"[freeable] cache written: {len(batch):,} rows for scan_id={scan_id}",
+            file=sys.stderr,
+        )
+    except Exception as e:
+        print(f"[freeable] warning: could not write cache: {e}", file=sys.stderr)
+
+
+def compute_freeable(con: sqlite3.Connection) -> tuple[dict, dict]:
+    """
+    Compute freeable bytes for every directory node.
+    Returns (freeable, locked_here) where both are dict[node_id -> bytes].
+
+    Freeable(dir) = sum of family credits whose LCA is in dir's subtree.
+    Locked_here(dir) = credits whose LCA is exactly this node AND members
+                       span 2+ distinct direct children of this node.
+
+    Uses streaming queries + dense arrays to stay under 1.5 GB peak RSS.
+    Results are cached in freeable_cache table keyed by scan_id.
+    """
+    t0 = time.time()
+
+    # Check cache first
+    scan_id = _get_latest_scan_id(con)
+    if scan_id is not None:
+        cached = _load_freeable_cache(con, scan_id)
+        if cached is not None:
+            return cached
+
+    print("[freeable] computing from scratch (no valid cache)...", file=sys.stderr)
+
+    # ------------------------------------------------------------------
+    # Step 1: Build dense arrays for parent_id and depth indexed by node_id
+    # ------------------------------------------------------------------
+    print("[freeable] building parent/depth arrays...", file=sys.stderr)
+    t1 = time.time()
+
+    max_id_row = con.execute("SELECT MAX(id) FROM files").fetchone()
+    max_id: int = max_id_row[0] if max_id_row and max_id_row[0] else 0
+
+    # array('q') = signed 64-bit. Use -1 as sentinel (no parent = root).
+    # parent_arr[i] = parent_id of node i, or -1 if root or not present
+    parent_arr = array.array('q', [-1] * (max_id + 1))
+    # depth_arr[i] = depth of node i (-1 = not yet set)
+    depth_arr = array.array('i', [-1] * (max_id + 1))
+    # is_dir_arr[i]: 0=file/not-present, 1=regular dir, 2=excluded dir
+    is_dir_arr = array.array('b', [0] * (max_id + 1))
+    # size_blocks for excluded dirs (leaf aggregate)
+    excl_blocks_arr = array.array('q', [0] * (max_id + 1))
+
+    roots_list: list[int] = []
+    children_map: dict[int, list[int]] = collections.defaultdict(list)
+
+    for row in con.execute(
+        "SELECT id, parent_id, is_dir, is_excluded, size_blocks FROM files"
+    ):
+        nid: int = row[0]
+        pid = row[1]
+        is_dir: int = row[2]
+        is_excl: int = row[3]
+        blk: int = row[4]
+
+        if pid is None:
+            parent_arr[nid] = -1
+            roots_list.append(nid)
+        else:
+            parent_arr[nid] = pid
+            children_map[pid].append(nid)
+
+        if is_dir:
+            is_dir_arr[nid] = 2 if is_excl else 1
+        if is_excl:
+            excl_blocks_arr[nid] = blk
+
+    # BFS to compute depths
+    q: collections.deque = collections.deque()
+    for r in roots_list:
+        depth_arr[r] = 0
+        q.append(r)
+    while q:
+        nid = q.popleft()
+        d = depth_arr[nid]
+        for child in children_map.get(nid, []):
+            if depth_arr[child] < 0:
+                depth_arr[child] = d + 1
+                q.append(child)
+
+    print(
+        f"[freeable] arrays built in {time.time()-t1:.1f}s, max_id={max_id:,}",
+        file=sys.stderr,
+    )
+
+    # ------------------------------------------------------------------
+    # Step 2: Build excluded-blocks-sum dict (per excluded_id)
+    # One GROUP BY query => ~3,812 entries
+    # ------------------------------------------------------------------
+    excl_ef_total: dict[int, int] = {}
+    try:
+        for row in con.execute(
+            "SELECT excluded_id, SUM(blocks_sum) AS total FROM excluded_families "
+            "GROUP BY excluded_id"
+        ):
+            excl_ef_total[row[0]] = row[1] or 0
+    except sqlite3.OperationalError:
+        pass  # table may not exist on older DBs
+
+    # ------------------------------------------------------------------
+    # Step 3: Build temp table of multi-member clone_ids
+    # This avoids materialising a Python set of 2.4M ids.
+    # ------------------------------------------------------------------
+    print("[freeable] building multi-clone temp table...", file=sys.stderr)
+    t3 = time.time()
+    try:
+        con.execute("DROP TABLE IF EXISTS temp.multi_cids")
+    except Exception:
+        pass
+    try:
+        con.executescript("""
+        CREATE TEMP TABLE multi_cids AS
+          SELECT clone_id FROM (
+            SELECT clone_id FROM files WHERE clone_id IS NOT NULL AND is_dir=0
+            UNION ALL
+            SELECT clone_id FROM excluded_families
+          ) GROUP BY clone_id HAVING COUNT(*) > 1;
+        CREATE INDEX temp.idx_mc ON multi_cids(clone_id);
+        """)
+    except sqlite3.OperationalError:
+        # excluded_families may not exist — fall back to files-only
+        try:
+            con.execute("DROP TABLE IF EXISTS temp.multi_cids")
+        except Exception:
+            pass
+        con.executescript("""
+        CREATE TEMP TABLE multi_cids AS
+          SELECT clone_id FROM files
+          WHERE clone_id IS NOT NULL AND is_dir=0
+          GROUP BY clone_id HAVING COUNT(*) > 1;
+        CREATE INDEX temp.idx_mc ON multi_cids(clone_id);
+        """)
+    print(
+        f"[freeable] multi_cids table built in {time.time()-t3:.1f}s", file=sys.stderr
+    )
+
+    # ------------------------------------------------------------------
+    # Step 4: Streaming clone + excluded-family pass (one family at a time)
+    # ------------------------------------------------------------------
+    print("[freeable] streaming clone families...", file=sys.stderr)
+    t4 = time.time()
+
+    # credit_arr[i] = direct credit assigned to node i
+    credit_arr = array.array('q', [0] * (max_id + 1))
+    # locked_contrib: list of (lca_node, credit_bytes, child_set)
+    locked_contrib: list = []
+
+    # Union stream: real file members (is_excl=0) and excluded pseudo-members (is_excl=1)
+    # The stream yields: (clone_id, is_excl, node_id, blocks)
+    # where for real files blocks = size_blocks, for excl = max_blocks (per ef row)
+    try:
+        stream_sql = """
+        SELECT clone_id, 0 AS is_excl, id AS node_id, size_blocks AS blocks
+          FROM files
+          WHERE clone_id IS NOT NULL AND is_dir=0
+        UNION ALL
+        SELECT clone_id, 1, excluded_id, max_blocks
+          FROM excluded_families
+        ORDER BY clone_id
+        """
+        cur_stream = con.execute(stream_sql)
+    except sqlite3.OperationalError:
+        # excluded_families missing -- files only
+        stream_sql = """
+        SELECT clone_id, 0 AS is_excl, id AS node_id, size_blocks AS blocks
+          FROM files
+          WHERE clone_id IS NOT NULL AND is_dir=0
+        ORDER BY clone_id
+        """
+        cur_stream = con.execute(stream_sql)
+
+    # We process one family at a time: accumulate members, then when clone_id changes, finalize.
+    fam_cid: int = -1
+    fam_members: list = []    # list of (node_id, blocks, is_excl)
+    fam_max_blocks: int = 0
+    families_processed = 0
+
+    def _finalize_clone_family(cid: int, members: list, max_blk: int) -> None:
+        """Process one clone family: compute LCA, assign credit, record locked_contrib."""
+        if len(members) < 2:
+            # Singleton family — will be handled in singleton pass
+            return
+
+        # Incremental LCA: running_lca starts at first member, updated with each subsequent
+        running_lca: int = -1
+        # We still need to hold member node_ids for the child_span check (families are small)
+        member_ids: list[int] = []
+
+        for (nid, blk, is_excl) in members:
+            if nid > max_id or depth_arr[nid] < 0:
+                # Member not in our tree (outside scanned roots) -- skip entire family
+                return
+            member_ids.append(nid)
+            if running_lca < 0:
+                running_lca = nid
+            else:
+                running_lca = _lca_arr(running_lca, nid, depth_arr, parent_arr, max_id)
+                if running_lca < 0:
+                    return  # spans multiple roots
+
+        if running_lca < 0:
+            return
+
+        credit_arr[running_lca] += max_blk
+
+        # child_span check for locked_here
+        child_set: set = set()
+        for nid in member_ids:
+            if nid == running_lca:
+                child_set.add(running_lca)
+            else:
+                dc = _direct_child_of_arr(running_lca, nid, parent_arr)
+                child_set.add(dc)
+
+        if len(child_set) >= 2:
+            locked_contrib.append((running_lca, max_blk, child_set))
+
+    for row in cur_stream:
+        cid = row[0]
+        is_excl = row[1]
+        nid = row[2]
+        blk = row[3]
+
+        if cid != fam_cid:
+            # Finalize previous family
+            if fam_cid >= 0:
+                _finalize_clone_family(fam_cid, fam_members, fam_max_blocks)
+                families_processed += 1
+                if families_processed % 100000 == 0:
+                    elapsed_f = time.time() - t4
+                    print(
+                        f"[freeable]   clone families: {families_processed:,} "
+                        f"in {elapsed_f:.1f}s",
+                        file=sys.stderr,
+                    )
+            fam_cid = cid
+            fam_members = []
+            fam_max_blocks = 0
+
+        fam_members.append((nid, blk, is_excl))
+        if blk > fam_max_blocks:
+            fam_max_blocks = blk
+
+    # Finalize last family
+    if fam_cid >= 0:
+        _finalize_clone_family(fam_cid, fam_members, fam_max_blocks)
+        families_processed += 1
+
+    print(
+        f"[freeable] clone pass done: {families_processed:,} families in "
+        f"{time.time()-t4:.1f}s",
+        file=sys.stderr,
+    )
+
+    # ------------------------------------------------------------------
+    # Step 5: Hardlink family pass (streaming by dev,ino ordered)
+    # Files with clone_id are excluded from hardlink grouping.
+    # ------------------------------------------------------------------
+    print("[freeable] streaming hardlink families...", file=sys.stderr)
+    t5 = time.time()
+
+    try:
+        hl_cur = con.execute(
+            "SELECT dev, ino, id, nlinks, size_blocks "
+            "FROM files "
+            "WHERE is_dir=0 AND clone_id IS NULL AND nlinks > 1 "
+            "ORDER BY dev, ino"
+        )
+    except Exception as e:
+        print(f"[freeable] hardlink query error: {e}", file=sys.stderr)
+        hl_cur = iter([])
+
+    hl_dev: int = -1
+    hl_ino: int = -1
+    hl_members: list = []   # list of (node_id, nlinks, size_blocks)
+
+    def _finalize_hl_family(members: list) -> None:
+        if not members:
+            return
+        nlinks = members[0][1]
+        if len(members) < nlinks:
+            # External links -- conservative: skip (credit 0)
+            return
+        # All in DB: credit once at LCA
+        credit = members[0][2]
+        running_lca = -1
+        member_ids: list[int] = []
+        for (nid, nl, blk) in members:
+            if nid > max_id or depth_arr[nid] < 0:
+                return
+            member_ids.append(nid)
+            if running_lca < 0:
+                running_lca = nid
+            else:
+                running_lca = _lca_arr(running_lca, nid, depth_arr, parent_arr, max_id)
+                if running_lca < 0:
+                    return
+
+        if running_lca < 0:
+            return
+
+        credit_arr[running_lca] += credit
+
+        child_set: set = set()
+        for nid in member_ids:
+            if nid == running_lca:
+                child_set.add(running_lca)
+            else:
+                dc = _direct_child_of_arr(running_lca, nid, parent_arr)
+                child_set.add(dc)
+        if len(child_set) >= 2:
+            locked_contrib.append((running_lca, credit, child_set))
+
+    for row in hl_cur:
+        dev = row[0]
+        ino = row[1]
+        nid = row[2]
+        nlinks = row[3]
+        blk = row[4]
+
+        if dev != hl_dev or ino != hl_ino:
+            _finalize_hl_family(hl_members)
+            hl_dev = dev
+            hl_ino = ino
+            hl_members = []
+
+        hl_members.append((nid, nlinks, blk))
+
+    _finalize_hl_family(hl_members)
+    print(
+        f"[freeable] hardlink pass done in {time.time()-t5:.1f}s", file=sys.stderr
+    )
+
+    # ------------------------------------------------------------------
+    # Step 6: Singleton pass -- streaming via SQL (never builds a Python set)
+    # Uses the temp table multi_cids to exclude multi-member clone families.
+    # nlinks=1 files not in multi_cids get credited to their parent.
+    # ------------------------------------------------------------------
+    print("[freeable] streaming singleton pass...", file=sys.stderr)
+    t6 = time.time()
+
+    try:
+        sing_cur = con.execute(
+            "SELECT parent_id, size_blocks FROM files "
+            "WHERE is_dir=0 AND nlinks=1 "
+            "AND (clone_id IS NULL OR clone_id NOT IN (SELECT clone_id FROM multi_cids))"
+        )
+        for row in sing_cur:
+            pid = row[0]
+            blk = row[1]
+            if pid is None:
+                continue
+            if 0 < pid <= max_id:
+                credit_arr[pid] += blk
+    except Exception as e:
+        print(f"[freeable] singleton query error: {e}", file=sys.stderr)
+
+    print(
+        f"[freeable] singleton pass done in {time.time()-t6:.1f}s", file=sys.stderr
+    )
+
+    # ------------------------------------------------------------------
+    # Step 7: Excluded subtree residual credits
+    # residual[excl_id] = max(0, excl_blocks - sum(ef.blocks_sum for ef in this excl_id))
+    # Credited to the excluded node itself (treated as leaf in bottom-up pass).
+    # ------------------------------------------------------------------
+    print("[freeable] computing excluded residuals...", file=sys.stderr)
+    for nid in range(1, max_id + 1):
+        if is_dir_arr[nid] == 2:  # excluded dir
+            total_ef = excl_ef_total.get(nid, 0)
+            residual = excl_blocks_arr[nid] - total_ef
+            if residual > 0:
+                credit_arr[nid] += residual
+
+    # ------------------------------------------------------------------
+    # Step 8: Bottom-up subtree accumulation via depth buckets
+    # ------------------------------------------------------------------
+    print("[freeable] bottom-up accumulation via depth buckets...", file=sys.stderr)
+    t8 = time.time()
+
+    # Find max depth
+    max_depth = 0
+    for nid in range(1, max_id + 1):
+        d = depth_arr[nid]
+        if d > max_depth:
+            max_depth = d
+
+    # Build depth buckets: bucket[d] = list of node_ids at depth d
+    buckets: list[list[int]] = [[] for _ in range(max_depth + 1)]
+    for nid in range(1, max_id + 1):
+        d = depth_arr[nid]
+        if d >= 0:
+            buckets[d].append(nid)
+
+    # subtree_arr[nid] = accumulated subtree freeable (not counting own credit)
+    # Propagate bottom-up: parent's subtree += child's (credit + subtree)
+    subtree_arr = array.array('q', [0] * (max_id + 1))
+
+    # Process deepest levels first
+    for d in range(max_depth, -1, -1):
+        for nid in buckets[d]:
+            isd = is_dir_arr[nid]
+            if isd == 1:  # regular dir (not excluded)
+                # propagate to parent
+                pid = parent_arr[nid]
+                if 0 < pid <= max_id:
+                    subtree_arr[pid] += credit_arr[nid] + subtree_arr[nid]
+            elif isd == 2:  # excluded dir (leaf aggregate)
+                # propagate credit to parent (no subtree from inside)
+                pid = parent_arr[nid]
+                if 0 < pid <= max_id:
+                    subtree_arr[pid] += credit_arr[nid]
+            # files (isd==0): credits were already placed on parent_id in earlier steps;
+            # nothing to propagate from the file node itself
+
+    print(
+        f"[freeable] bottom-up done in {time.time()-t8:.1f}s", file=sys.stderr
+    )
+
+    # ------------------------------------------------------------------
+    # Step 9: Materialise freeable and locked_here dicts (non-zero only)
+    # ------------------------------------------------------------------
+    print("[freeable] materialising result dicts...", file=sys.stderr)
+    freeable: dict[int, int] = {}
+    for nid in range(1, max_id + 1):
+        if is_dir_arr[nid] > 0:  # dir or excluded dir
+            val = credit_arr[nid] + subtree_arr[nid]
+            if val:
+                freeable[nid] = val
+
+    # locked_here: resolve child_set -> direct children of lca_node
+    locked_here_d: dict[int, int] = collections.defaultdict(int)
+    for (lca_node, credit, child_set) in locked_contrib:
+        direct_children_of_lca: set = set()
+        for cs in child_set:
+            if cs == lca_node:
+                continue
+            if 0 < cs <= max_id and parent_arr[cs] == lca_node:
+                direct_children_of_lca.add(cs)
+            else:
+                # Walk up to direct child of lca_node
+                cur = cs
+                while 0 < cur <= max_id:
+                    p = parent_arr[cur]
+                    if p < 0 or p == lca_node:
+                        direct_children_of_lca.add(cur)
+                        break
+                    cur = p
+        if len(direct_children_of_lca) >= 2:
+            locked_here_d[lca_node] += credit
+
+    locked_here = dict(locked_here_d)
+
+    elapsed = time.time() - t0
+    print(
+        f"[freeable] done in {elapsed:.1f}s, {len(freeable):,} dirs with freeable>0",
+        file=sys.stderr,
+    )
+
+    # Persist cache
+    if scan_id is not None:
+        _persist_freeable_cache(DB_PATH, scan_id, freeable, locked_here)
+
+    return freeable, locked_here
+
+# ---------------------------------------------------------------------------
+# SERVE subcommand — local web UI (treesize-style)
+# ---------------------------------------------------------------------------
+import threading
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+# --------------- pre-compute ------------------------------------------------
+
+def _build_dir_agg(con: sqlite3.Connection) -> dict:
+    """
+    Walk the DB bottom-up and build dir_agg[file_id] = {
+        total_blocks, total_logical, total_files, direct_blocks
+    }
+    for every directory.  Excluded subtree rows are treated as pre-summed
+    leaves (their size_blocks / excluded_file_count are already aggregates).
+    """
+    t0 = time.time()
+    print("[serve] pre-computing directory aggregates...", file=sys.stderr)
+
+    # Load all rows in one pass
+    print("[serve]   loading all file rows...", file=sys.stderr)
+    rows = con.execute(
+        "SELECT id, parent_id, is_dir, is_excluded, size_blocks, size_logical, "
+        "       excluded_file_count "
+        "FROM files"
+    ).fetchall()
+    print(f"[serve]   loaded {len(rows):,} rows in {time.time()-t0:.1f}s", file=sys.stderr)
+
+    # Index: parent_id -> list of child rows
+    children_of: dict[int | None, list] = {}
+    all_ids: set[int] = set()
+    for r in rows:
+        pid = r["parent_id"]
+        if pid not in children_of:
+            children_of[pid] = []
+        children_of[pid].append(r)
+        all_ids.add(r["id"])
+
+    # dir_agg accumulates totals; leaf files contribute directly
+    dir_agg: dict[int, dict] = {}
+
+    # Topological sort: process directories in leaf-first order using
+    # an iterative post-order DFS.
+    # Find root(s): parent_id IS NULL
+    roots = [r for r in rows if r["parent_id"] is None]
+
+    t1 = time.time()
+    print(f"[serve]   starting bottom-up traversal ({len(roots)} root(s))...", file=sys.stderr)
+
+    processed = 0
+    stack: list[tuple] = []  # (row, phase)  phase=0 push children, phase=1 aggregate
+    for root in roots:
+        stack.append((root, 0))
+
+    while stack:
+        row, phase = stack.pop()
+        fid = row["id"]
+
+        if phase == 0:
+            if row["is_dir"] and not row["is_excluded"]:
+                # Push phase-1 marker first (runs after children)
+                stack.append((row, 1))
+                # Then push all children
+                for child in children_of.get(fid, []):
+                    stack.append((child, 0))
+            elif row["is_excluded"]:
+                # Excluded subtree: treat as leaf aggregate
+                # Initialize its own entry so parent can find it
+                dir_agg[fid] = {
+                    "total_blocks": row["size_blocks"],
+                    "total_logical": row["size_logical"],
+                    "total_files": row["excluded_file_count"] or 0,
+                    "direct_blocks": row["size_blocks"],
+                }
+            # non-dir leaf files are handled in their parent's phase-1
+        else:
+            # phase 1: aggregate children into this dir
+            total_blocks = 0
+            total_logical = 0
+            total_files = 0
+            direct_blocks = 0
+
+            for child in children_of.get(fid, []):
+                cid = child["id"]
+                if child["is_dir"] and not child["is_excluded"]:
+                    # Recursive subtree already computed
+                    sub = dir_agg.get(cid)
+                    if sub:
+                        total_blocks += sub["total_blocks"]
+                        total_logical += sub["total_logical"]
+                        total_files += sub["total_files"]
+                elif child["is_excluded"]:
+                    # Excluded subtree leaf
+                    total_blocks += child["size_blocks"]
+                    total_logical += child["size_logical"]
+                    total_files += child["excluded_file_count"] or 0
+                    direct_blocks += child["size_blocks"]
+                else:
+                    # Regular file / symlink
+                    total_blocks += child["size_blocks"]
+                    total_logical += child["size_logical"]
+                    total_files += 1
+                    direct_blocks += child["size_blocks"]
+
+            dir_agg[fid] = {
+                "total_blocks": total_blocks,
+                "total_logical": total_logical,
+                "total_files": total_files,
+                "direct_blocks": direct_blocks,
+            }
+            processed += 1
+            if processed % 50000 == 0:
+                elapsed = time.time() - t1
+                print(f"[serve]   processed {processed:,} dirs in {elapsed:.1f}s", file=sys.stderr)
+
+    elapsed = time.time() - t0
+    print(f"[serve] pre-compute done: {len(dir_agg):,} dirs in {elapsed:.1f}s", file=sys.stderr)
+    return dir_agg
+
+
+# --------------- path cache -------------------------------------------------
+
+class _PathCache:
+    """Thread-safe memoized full_path() using per-thread DB connections."""
+    def __init__(self, db_path: str):
+        self._db_path = db_path
+        self._cache: dict[int, str] = {}
+        self._lock = threading.Lock()
+        self._local = threading.local()
+
+    def _get_con(self) -> sqlite3.Connection:
+        con = getattr(self._local, "con", None)
+        if con is None:
+            con = sqlite3.connect(self._db_path)
+            con.row_factory = sqlite3.Row
+            con.execute("PRAGMA query_only = 1")
+            self._local.con = con
+        return con
+
+    def get(self, file_id: int) -> str:
+        with self._lock:
+            if file_id in self._cache:
+                return self._cache[file_id]
+        path = full_path(self._get_con(), file_id)
+        with self._lock:
+            self._cache[file_id] = path
+        return path
+
+
+# --------------- marginal query (adapted from cmd_marginal) -----------------
+
+def _marginal_for_id(con: sqlite3.Connection, root_id: int) -> dict:
+    """Return freeable bytes for the given subtree (family-once semantics)."""
+    t0 = time.time()
+    result = _compute_marginal_freeable(con, root_id)
+    duration_ms = int((time.time() - t0) * 1000)
+    return {
+        "id": root_id,
+        "strict_bytes": result["strict_bytes"],
+        "proportional_bytes": result["strict_bytes"],  # backward compat
+        "apparent_bytes": result["apparent_bytes"],
+        "duration_ms": duration_ms,
+    }
+
+
+# --------------- inline HTML page -------------------------------------------
+
+_HTML_PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>dskdb — disk explorer</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: #1a1a1a;
+  color: #e0e0e0;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-size: 13px;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+#header {
+  padding: 8px 14px;
+  background: #111;
+  border-bottom: 1px solid #333;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-shrink: 0;
+}
+#breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 1;
+  overflow: hidden;
+}
+.crumb {
+  cursor: pointer;
+  color: #7eb8f7;
+  white-space: nowrap;
+}
+.crumb:hover { text-decoration: underline; }
+.crumb-sep { color: #555; }
+.crumb-cur { color: #e0e0e0; cursor: default; }
+#mode-toggle {
+  display: flex;
+  gap: 10px;
+  flex-shrink: 0;
+}
+.mode-btn {
+  background: none;
+  border: 1px solid #444;
+  color: #aaa;
+  padding: 3px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  font-family: inherit;
+}
+.mode-btn.active {
+  border-color: #7eb8f7;
+  color: #7eb8f7;
+  background: rgba(126,184,247,0.08);
+}
+#main {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  flex: 1;
+  overflow: hidden;
+  gap: 0;
+}
+#list-pane {
+  overflow-y: auto;
+  border-right: 1px solid #333;
+}
+#treemap-pane {
+  overflow: hidden;
+  position: relative;
+}
+#treemap {
+  width: 100%;
+  height: 100%;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+thead th {
+  position: sticky;
+  top: 0;
+  background: #222;
+  padding: 6px 10px;
+  text-align: left;
+  color: #888;
+  font-weight: normal;
+  border-bottom: 1px solid #333;
+  white-space: nowrap;
+}
+thead th.right { text-align: right; }
+tbody tr {
+  border-bottom: 1px solid #2a2a2a;
+}
+tbody tr:hover { background: #252525; }
+tbody tr.clickable { cursor: pointer; }
+tbody tr.clickable:hover { background: #2a3040; }
+tbody tr.excluded { background: #2a2500; }
+tbody tr.excluded:hover { background: #332d00; }
+td {
+  padding: 5px 10px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+td.name {
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+td.size { text-align: right; color: #b0d0ff; min-width: 90px; }
+td.files { text-align: right; color: #888; min-width: 70px; }
+td.bar { min-width: 80px; max-width: 120px; }
+td.marginal { text-align: right; color: #ffcc66; min-width: 90px; }
+.bar-inner {
+  height: 10px;
+  border-radius: 2px;
+}
+.tag-excl {
+  display: inline-block;
+  background: #5a4a00;
+  color: #ffd66b;
+  border: 1px solid #7a6600;
+  border-radius: 3px;
+  padding: 0 5px;
+  font-size: 10px;
+  margin-left: 5px;
+  vertical-align: middle;
+}
+.m-btn {
+  background: #333;
+  border: 1px solid #555;
+  color: #aaa;
+  padding: 1px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 11px;
+  font-family: inherit;
+}
+.m-btn:hover { background: #444; }
+#loading {
+  position: absolute;
+  inset: 0;
+  background: rgba(26,26,26,0.8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #7eb8f7;
+  font-size: 14px;
+  z-index: 10;
+}
+#loading.hidden { display: none; }
+#error-banner {
+  background: #4a0000;
+  color: #ff8888;
+  padding: 8px 14px;
+  border-bottom: 1px solid #800000;
+  display: none;
+}
+</style>
+</head>
+<body>
+<div id="error-banner"></div>
+<div id="header">
+  <div id="breadcrumb"></div>
+  <div id="mode-toggle">
+    <button class="mode-btn active" data-mode="freeable" onclick="setMode('freeable')">Freeable</button>
+    <button class="mode-btn" data-mode="blocks" onclick="setMode('blocks')">Allocated (du)</button>
+    <button class="mode-btn" data-mode="logical" onclick="setMode('logical')">Logical</button>
+  </div>
+  <div id="mode-legend" style="font-size:11px;color:#666;flex-shrink:0;max-width:380px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="Freeable = what rm -rf would actually return to df. Allocated double-counts APFS clones (e.g. git worktrees).">
+    Freeable = what rm -rf returns to df. Allocated double-counts APFS clones.
+  </div>
+</div>
+<div id="main">
+  <div id="list-pane">
+    <div id="loading"><span>Loading...</span></div>
+    <table id="files-table">
+      <thead>
+        <tr>
+          <th class="name">Name</th>
+          <th class="right">Size</th>
+          <th class="right">Files</th>
+          <th>Bar</th>
+        </tr>
+      </thead>
+      <tbody id="files-tbody"></tbody>
+    </table>
+  </div>
+  <div id="treemap-pane">
+    <div id="treemap"></div>
+  </div>
+</div>
+
+<script src="https://fastly.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<script>
+// ---- global state ----
+const state = {
+  currentId: null,
+  breadcrumb: [],
+  children: [],
+  nodeInfo: null,
+  mode: 'freeable',
+};
+
+let chart = null;
+
+// ---- init ----
+window.addEventListener('DOMContentLoaded', async () => {
+  chart = echarts.init(document.getElementById('treemap'));
+  chart.on('click', (params) => {
+    if (params && params.data && params.data.id) {
+      navigateTo(params.data.id);
+    }
+  });
+  window.addEventListener('resize', () => chart && chart.resize());
+
+  // Check URL for deep-link
+  const params = new URLSearchParams(window.location.search);
+  const startId = params.get('id') ? parseInt(params.get('id')) : null;
+
+  try {
+    const root = await apiFetch('/api/root');
+    if (root.error) {
+      showError(root.error);
+      return;
+    }
+    if (startId) {
+      // Load breadcrumb then navigate
+      const crumbs = await apiFetch('/api/breadcrumb/' + startId);
+      if (crumbs && crumbs.length) {
+        await navigateTo(startId, crumbs);
+        return;
+      }
+    }
+    await navigateTo(root.id);
+  } catch(e) {
+    showError('Failed to connect: ' + e.message);
+  }
+});
+
+// ---- navigation ----
+async function navigateTo(id, existingBreadcrumb) {
+  setLoading(true);
+  try {
+    const data = await apiFetch('/api/node/' + id);
+    if (data.error) { showError(data.error); return; }
+
+    state.currentId = id;
+    state.nodeInfo = data.node;
+    state.children = data.children || [];
+
+    // Breadcrumb
+    if (existingBreadcrumb) {
+      state.breadcrumb = existingBreadcrumb;
+    } else {
+      const crumbs = await apiFetch('/api/breadcrumb/' + id);
+      state.breadcrumb = crumbs || [];
+    }
+
+    // Update URL
+    const url = new URL(window.location);
+    url.searchParams.set('id', id);
+    window.history.pushState({id}, '', url);
+
+    render();
+  } catch(e) {
+    showError('Navigation failed: ' + e.message);
+  } finally {
+    setLoading(false);
+  }
+}
+
+window.addEventListener('popstate', (e) => {
+  if (e.state && e.state.id) navigateTo(e.state.id);
+});
+
+// ---- rendering ----
+function render() {
+  renderBreadcrumb();
+  renderTable();
+  renderTreemap();
+}
+
+function renderBreadcrumb() {
+  const el = document.getElementById('breadcrumb');
+  el.innerHTML = '';
+  state.breadcrumb.forEach((crumb, i) => {
+    if (i > 0) {
+      const sep = document.createElement('span');
+      sep.className = 'crumb-sep';
+      sep.textContent = ' / ';
+      el.appendChild(sep);
+    }
+    const span = document.createElement('span');
+    const isLast = i === state.breadcrumb.length - 1;
+    span.className = isLast ? 'crumb crumb-cur' : 'crumb';
+    span.textContent = crumb.name;
+    span.title = crumb.name;
+    if (!isLast) {
+      span.onclick = () => navigateTo(crumb.id);
+    }
+    el.appendChild(span);
+  });
+}
+
+function sizeField(child) {
+  if (state.mode === 'logical') return child.total_logical;
+  if (state.mode === 'blocks') return child.total_blocks;
+  // freeable (default)
+  return child.freeable || 0;
+}
+
+function renderTable() {
+  const tbody = document.getElementById('files-tbody');
+  tbody.innerHTML = '';
+
+  const children = [...state.children];
+  // sort by current size field
+  children.sort((a, b) => sizeField(b) - sizeField(a));
+
+  const maxSize = children.reduce((m, c) => Math.max(m, sizeField(c)), 1);
+
+  // Locked-here banner: if current node has significant locked_here, show at top
+  const LOCKED_THRESHOLD = 100 * 1024 * 1024;
+  if (state.mode === 'freeable' && state.nodeInfo && (state.nodeInfo.locked_here || 0) > LOCKED_THRESHOLD) {
+    const trLock = document.createElement('tr');
+    trLock.style.cssText = 'background:#2a1a40;color:#bb99ff;';
+    const tdLock = document.createElement('td');
+    tdLock.colSpan = 4;
+    tdLock.style.cssText = 'padding:6px 10px;font-style:italic;';
+    tdLock.textContent = '⛓ locked across children — freed only if all deleted: ' + fmtBytes(state.nodeInfo.locked_here);
+    trLock.appendChild(tdLock);
+    tbody.appendChild(trLock);
+  }
+
+  children.forEach(child => {
+    const sz = sizeField(child);
+    const frac = maxSize > 0 ? sz / maxSize : 0;
+    // Color: blue (small) → red (big)
+    const r = Math.round(frac * 220);
+    const g = Math.round(60 + (1 - frac) * 100);
+    const b = Math.round((1 - frac) * 220 + 30);
+    const barColor = `rgb(${r},${g},${b})`;
+
+    const tr = document.createElement('tr');
+    if (child.is_excluded) tr.classList.add('excluded');
+    if (child.is_dir) {
+      tr.classList.add('clickable');
+      tr.title = child.name;
+      tr.onclick = () => navigateTo(child.id);
+    }
+
+    // Name cell
+    const tdName = document.createElement('td');
+    tdName.className = 'name';
+    const nameSpan = document.createElement('span');
+    nameSpan.textContent = child.name;
+    tdName.appendChild(nameSpan);
+    if (child.is_excluded) {
+      const tag = document.createElement('span');
+      tag.className = 'tag-excl';
+      tag.textContent = 'excl';
+      tdName.appendChild(tag);
+    }
+    tr.appendChild(tdName);
+
+    // Size
+    const tdSize = document.createElement('td');
+    tdSize.className = 'size';
+    tdSize.textContent = fmtBytes(sz);
+    tr.appendChild(tdSize);
+
+    // Files
+    const tdFiles = document.createElement('td');
+    tdFiles.className = 'files';
+    tdFiles.textContent = fmtCount(child.total_files);
+    tr.appendChild(tdFiles);
+
+    // Bar
+    const tdBar = document.createElement('td');
+    tdBar.className = 'bar';
+    const barDiv = document.createElement('div');
+    barDiv.className = 'bar-inner';
+    barDiv.style.width = Math.max(2, Math.round(frac * 100)) + '%';
+    barDiv.style.background = barColor;
+    tdBar.appendChild(barDiv);
+    tr.appendChild(tdBar);
+
+    tbody.appendChild(tr);
+  });
+}
+
+function renderTreemap() {
+  if (!chart) return;
+  const children = state.children;
+  const data = children.map(c => ({
+    name: c.name,
+    value: sizeField(c) || 0,
+    id: c.id,
+    itemStyle: c.is_excluded ? { color: '#c8a000', opacity: 0.9 } : undefined,
+  })).filter(d => d.value > 0);
+
+  chart.setOption({
+    backgroundColor: '#1a1a1a',
+    series: [{
+      type: 'treemap',
+      roam: false,
+      nodeClick: false,
+      breadcrumb: { show: false },
+      width: '100%',
+      height: '100%',
+      label: {
+        show: true,
+        formatter: (p) => p.data.name + '\n' + fmtBytes(p.data.value),
+        color: '#e0e0e0',
+        fontSize: 11,
+        overflow: 'truncate',
+      },
+      upperLabel: { show: false },
+      itemStyle: {
+        gapWidth: 2,
+        borderColor: '#1a1a1a',
+        color: '#3a5a8a',
+      },
+      emphasis: {
+        itemStyle: { borderColor: '#7eb8f7', borderWidth: 2 }
+      },
+      data: data,
+    }]
+  });
+}
+
+// ---- mode toggle ----
+function setMode(mode) {
+  state.mode = mode;
+  document.querySelectorAll('.mode-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.mode === mode);
+  });
+  render();
+}
+
+// ---- helpers ----
+function setLoading(on) {
+  document.getElementById('loading').classList.toggle('hidden', !on);
+}
+
+function showError(msg) {
+  const el = document.getElementById('error-banner');
+  el.textContent = msg;
+  el.style.display = 'block';
+}
+
+async function apiFetch(path) {
+  const res = await fetch(path);
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`HTTP ${res.status}: ${txt}`);
+  }
+  return res.json();
+}
+
+function fmtBytes(n) {
+  if (n === null || n === undefined) return '—';
+  if (n < 0) return '-' + fmtBytes(-n);
+  const GiB = 1 << 30, MiB = 1 << 20, KiB = 1 << 10;
+  if (n >= GiB) return (n / GiB).toFixed(1) + ' GiB';
+  if (n >= MiB) return (n / MiB).toFixed(1) + ' MiB';
+  if (n >= KiB) return (n / KiB).toFixed(1) + ' KiB';
+  return n + ' B';
+}
+
+function fmtCount(n) {
+  if (!n) return '0';
+  if (n >= 1e6) return (n/1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n/1e3).toFixed(1) + 'k';
+  return String(n);
+}
+</script>
+</body>
+</html>
+"""
+
+_HTML_BYTES = _HTML_PAGE.encode("utf-8")
+
+
+# --------------- HTTP handler -----------------------------------------------
+
+class _DskdbHandler(BaseHTTPRequestHandler):
+    """Handles all HTTP requests for the dskdb serve UI."""
+
+    # These are set as class attributes by cmd_serve before the server starts
+    db_path: str = ""
+    dir_agg: dict = {}
+    path_cache: "_PathCache | None" = None
+    freeable_map: dict = {}
+    locked_here_map: dict = {}
+    _con_local = threading.local()  # per-thread DB connections
+
+    def log_message(self, fmt, *args):
+        # Suppress default access log; print to stderr cleanly
+        print(f"[serve] {self.address_string()} {fmt % args}", file=sys.stderr)
+
+    def _get_con(self) -> sqlite3.Connection:
+        """Return a per-thread read-only connection."""
+        con = getattr(self._con_local, "con", None)
+        if con is None:
+            con = sqlite3.connect(self.db_path)
+            con.row_factory = sqlite3.Row
+            con.execute("PRAGMA query_only = 1")
+            con.execute("PRAGMA cache_size = -262144")
+            self._con_local.con = con
+        return con
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+
+        try:
+            if path == "/" or path == "/index.html":
+                self._serve_html()
+            elif path == "/api/root":
+                self._api_root()
+            elif path.startswith("/api/node/"):
+                node_id = int(path[len("/api/node/"):])
+                self._api_node(node_id)
+            elif path.startswith("/api/marginal/"):
+                node_id = int(path[len("/api/marginal/"):])
+                self._api_marginal(node_id)
+            elif path.startswith("/api/breadcrumb/"):
+                node_id = int(path[len("/api/breadcrumb/"):])
+                self._api_breadcrumb(node_id)
+            else:
+                self._send_json({"error": "not found"}, status=404)
+        except ValueError:
+            self._send_json({"error": "invalid id"}, status=400)
+        except Exception as e:
+            self._send_json({"error": str(e)}, status=500)
+
+    def _serve_html(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(_HTML_BYTES)))
+        self.end_headers()
+        self.wfile.write(_HTML_BYTES)
+
+    def _api_root(self):
+        con = self._get_con()
+        scan = con.execute(
+            "SELECT root FROM scans ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if not scan:
+            self._send_json({"error": "no scans"}, status=404)
+            return
+        root_path = scan["root"]
+        row = con.execute(
+            "SELECT id FROM files WHERE parent_id IS NULL AND name = ?",
+            (root_path,),
+        ).fetchone()
+        if not row:
+            self._send_json({"error": "root node not found"}, status=404)
+            return
+        self._send_json({
+            "id": row["id"],
+            "path": root_path,
+            "name": root_path,
+        })
+
+    def _api_node(self, node_id: int):
+        con = self._get_con()
+        node_row = con.execute(
+            "SELECT id, parent_id, name, is_dir, is_excluded FROM files WHERE id = ?",
+            (node_id,),
+        ).fetchone()
+        if not node_row:
+            self._send_json({"error": "not found"}, status=404)
+            return
+
+        agg = self.dir_agg.get(node_id, {})
+        node_path = self.path_cache.get(node_id)
+
+        node_info = {
+            "id": node_id,
+            "path": node_path,
+            "name": node_row["name"],
+            "is_dir": node_row["is_dir"],
+            "is_excluded": node_row["is_excluded"],
+            "total_blocks": agg.get("total_blocks", 0),
+            "total_logical": agg.get("total_logical", 0),
+            "total_files": agg.get("total_files", 0),
+            "parent_id": node_row["parent_id"],
+            "freeable": self.freeable_map.get(node_id, 0),
+            "locked_here": self.locked_here_map.get(node_id, 0),
+        }
+
+        # Fetch immediate children
+        child_rows = con.execute(
+            "SELECT id, name, is_dir, is_excluded, size_blocks, size_logical, "
+            "       excluded_file_count "
+            "FROM files WHERE parent_id = ?",
+            (node_id,),
+        ).fetchall()
+
+        children = []
+        for cr in child_rows:
+            cid = cr["id"]
+            if cr["is_dir"] and not cr["is_excluded"]:
+                cagg = self.dir_agg.get(cid, {})
+                total_blocks = cagg.get("total_blocks", 0)
+                total_logical = cagg.get("total_logical", 0)
+                total_files = cagg.get("total_files", 0)
+            elif cr["is_excluded"]:
+                total_blocks = cr["size_blocks"]
+                total_logical = cr["size_logical"]
+                total_files = cr["excluded_file_count"] or 0
+            else:
+                # Regular file
+                total_blocks = cr["size_blocks"]
+                total_logical = cr["size_logical"]
+                total_files = 1
+
+            children.append({
+                "id": cid,
+                "name": cr["name"],
+                "is_dir": cr["is_dir"],
+                "is_excluded": cr["is_excluded"],
+                "total_blocks": total_blocks,
+                "total_logical": total_logical,
+                "total_files": total_files,
+                "freeable": self.freeable_map.get(cid, 0),
+                "locked_here": self.locked_here_map.get(cid, 0),
+            })
+
+        # Sort by freeable desc by default, limit 200
+        children.sort(key=lambda x: x["freeable"], reverse=True)
+        children = children[:200]
+
+        self._send_json({"node": node_info, "children": children})
+
+    def _api_marginal(self, node_id: int):
+        con = self._get_con()
+        row = con.execute("SELECT id FROM files WHERE id = ?", (node_id,)).fetchone()
+        if not row:
+            self._send_json({"error": "not found"}, status=404)
+            return
+        result = _marginal_for_id(con, node_id)
+        self._send_json(result)
+
+    def _api_breadcrumb(self, node_id: int):
+        con = self._get_con()
+        # Walk up via recursive CTE
+        rows = con.execute("""
+          WITH RECURSIVE chain(id, parent_id, name) AS (
+            SELECT id, parent_id, name FROM files WHERE id = ?
+            UNION ALL
+            SELECT f.id, f.parent_id, f.name FROM files f, chain c WHERE f.id = c.parent_id
+          )
+          SELECT id, name FROM chain
+        """, (node_id,)).fetchall()
+        crumbs = [{"id": r["id"], "name": r["name"]} for r in rows]
+        crumbs.reverse()
+        self._send_json(crumbs)
+
+    def _send_json(self, data, status: int = 200):
+        body = json.dumps(data).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+# --------------- main cmd_serve ---------------------------------------------
+
+def cmd_serve(args: argparse.Namespace) -> None:
+    con = open_db_for_read()
+    _init_schema(con)
+
+    # Pre-compute directory aggregates
+    dir_agg = _build_dir_agg(con)
+
+    # Pre-compute freeable metrics
+    freeable_map, locked_here_map = compute_freeable(con)
+
+    # Path cache (shared across threads, thread-safe, uses per-thread connections)
+    path_cache = _PathCache(DB_PATH)
+
+    # Set class-level state on handler (safe: single server, class used as singleton)
+    _DskdbHandler.db_path = DB_PATH
+    _DskdbHandler.dir_agg = dir_agg
+    _DskdbHandler.path_cache = path_cache
+    _DskdbHandler.freeable_map = freeable_map
+    _DskdbHandler.locked_here_map = locked_here_map
+
+    # Find an available port
+    port = args.port
+    max_port = args.port + 10
+    server = None
+    while port < max_port:
+        try:
+            server = ThreadingHTTPServer(("127.0.0.1", port), _DskdbHandler)
+            break
+        except OSError:
+            port += 1
+    if server is None:
+        sys.exit(f"error: could not bind to any port in range {args.port}–{max_port - 1}")
+
+    url = f"http://127.0.0.1:{port}/"
+    print(f"[serve] listening on {url}", file=sys.stderr)
+    print(url)  # stdout for scripts
+
+    # Open browser unless suppressed
+    if not args.no_browser:
+        subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _handle_sigint(sig, frame):
+        print("\n[serve] shutting down...", file=sys.stderr)
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGINT, _handle_sigint)
+
+    try:
+        server.serve_forever()
+    except Exception:
+        pass
+    print("[serve] done.", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# CLUSTERS subcommand
+# ---------------------------------------------------------------------------
+def cmd_clusters(args: argparse.Namespace) -> None:
+    """Report directories with largest locked_here (families spanning multiple children)."""
+    con = open_db_for_read()
+    _init_schema(con)
+
+    min_bytes = args.min_bytes
+    limit = args.limit
+
+    freeable_map, locked_here_map = compute_freeable(con)
+
+    # Sort by locked_here descending
+    ranked = sorted(locked_here_map.items(), key=lambda x: x[1], reverse=True)
+    ranked = [(nid, v) for nid, v in ranked if v >= min_bytes][:limit]
+
+    if not ranked:
+        print("(no clusters found)")
+        return
+
+    home = os.path.expanduser("~")
+
+    if args.json:
+        out = []
+        for nid, locked in ranked:
+            path = full_path(con, nid).replace(home, "~")
+            out.append({"path": path, "locked_bytes": locked})
+        print(json.dumps(out, indent=2))
+        return
+
+    for nid, locked in ranked:
+        path = full_path(con, nid).replace(home, "~")
+        children = con.execute(
+            "SELECT id, name FROM files WHERE parent_id = ?", (nid,)
+        ).fetchall()
+        n_children = len(children)
+        print(f"{fmt_bytes(locked)} locked at {path}  (members span ~{n_children} children)")
+        # Show top contributing children by freeable
+        child_freeable = [(c["name"], freeable_map.get(c["id"], 0)) for c in children]
+        child_freeable.sort(key=lambda x: x[1], reverse=True)
+        top6 = child_freeable[:6]
+        shown = 0
+        for name, fb in top6:
+            if fb > 0:
+                print(f"    members in: {name}")
+                shown += 1
+        rest = n_children - shown
+        if rest > 0:
+            print(f"    +{rest} more")
+        print()
+
+
+# ---------------------------------------------------------------------------
+# FREEABLE subcommand (debug/verification)
+# ---------------------------------------------------------------------------
+def cmd_freeable(args: argparse.Namespace) -> None:
+    """Show freeable bytes for a path (precomputed, family-once semantics)."""
+    path = os.path.realpath(args.path)
+    con = open_db_for_read()
+    _init_schema(con)
+
+    node_id = resolve_path_to_id(con, path)
+    if node_id is None:
+        sys.exit(f"error: path not in DB: {path}\nRun `dskdb scan` first.")
+
+    freeable_map, locked_here_map = compute_freeable(con)
+
+    f = freeable_map.get(node_id, 0)
+    lh = locked_here_map.get(node_id, 0)
+    print(f"Path: {path}")
+    print(f"  Freeable:    {fmt_bytes(f)}")
+    print(f"  Locked here: {fmt_bytes(lh)}")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="dskdb",
+        description="macOS APFS-aware disk-usage database (v2). Detects clones and hardlinks.",
+    )
+    p.add_argument("--db", default=None, help="Override DB path (or set DSKDB_DB env var)")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    # selftest
+    sub.add_parser("selftest", help="Verify APFS clone detection (ctypes getattrlist test)")
+
+    # scan
+    ps = sub.add_parser("scan", help="Walk a directory and index files")
+    ps.add_argument("path")
+    ps.add_argument("--quiet", "-q", action="store_true")
+    ps.add_argument("--no-clones", action="store_true", help="Skip clone_id detection (faster)")
+    ps.add_argument("--rescan", action="store_true", help="Delete existing scan for this root before scanning")
+    ps.add_argument("--cross-device", action="store_true", help="Follow mounts into other filesystems")
+    ps.add_argument("--min-free", type=float, default=MIN_FREE_GIB_DEFAULT, metavar="GIB",
+                    help=f"Abort scan if free disk drops below N GiB (default {MIN_FREE_GIB_DEFAULT})")
+    ps.add_argument("--exclude", action="append", metavar="NAME", default=[],
+                    help="Add a directory name to the exclusion list (repeatable)")
+    ps.add_argument("--include", action="append", metavar="NAME", default=[],
+                    help="Remove a name from the default exclusion list (repeatable)")
+    ps.add_argument("--no-default-excludes", action="store_true",
+                    help="Don't apply the default exclusion list")
+
+    # top
+    pt = sub.add_parser("top", help="Show top directories by size")
+    pt.add_argument("--under", default=None, help="Limit to this path prefix")
+    pt.add_argument("--by", default="blocks", choices=["blocks", "logical", "clones"])
+    pt.add_argument("--limit", "-n", type=int, default=20)
+    pt.add_argument("--depth", "-d", type=int, default=1)
+    pt.add_argument("--json", action="store_true")
+
+    # marginal
+    pm = sub.add_parser("marginal", help="Show marginal disk cost of a path")
+    pm.add_argument("path")
+    pm.add_argument("--json", action="store_true")
+
+    # file
+    pf = sub.add_parser("file", help="Show metadata for a single file")
+    pf.add_argument("path")
+
+    # clones
+    pc = sub.add_parser("clones", help="Rank clone families by waste")
+    pc.add_argument("--under", default=None)
+    pc.add_argument("--min-bytes", type=int, default=1024 * 1024, metavar="N")
+    pc.add_argument("--limit", "-n", type=int, default=20)
+    pc.add_argument("--json", action="store_true")
+
+    # excluded (NEW)
+    pe = sub.add_parser("excluded", help="List excluded subtrees with aggregate sizes")
+    pe.add_argument("--limit", "-n", type=int, default=50)
+
+    # clusters
+    pc2 = sub.add_parser("clusters", help="Report top delete-together groups by locked-at size")
+    pc2.add_argument("--min-bytes", type=int, default=100 * 1024 * 1024, metavar="N")
+    pc2.add_argument("--limit", "-n", type=int, default=20)
+    pc2.add_argument("--json", action="store_true")
+
+    # freeable (debug/verification)
+    pfr = sub.add_parser("freeable", help="Show precomputed freeable bytes for a path")
+    pfr.add_argument("path")
+
+    # sql
+    sub.add_parser("sql", help="Open DB in sqlite3 with helpful views")
+
+    # stats
+    sub.add_parser("stats", help="Show summary of last scan")
+
+    # serve
+    pserve = sub.add_parser("serve", help="Launch local web UI (treesize-style disk explorer)")
+    pserve.add_argument("--port", type=int, default=7777,
+                        help="Starting port (tries up to port+10 if taken, default 7777)")
+    pserve.add_argument("--no-browser", action="store_true",
+                        help="Don't auto-open browser")
+
+    return p
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    global DB_PATH
+    if args.db:
+        DB_PATH = args.db
+
+    dispatch = {
+        "selftest": cmd_selftest,
+        "scan":     cmd_scan,
+        "top":      cmd_top,
+        "marginal": cmd_marginal,
+        "file":     cmd_file,
+        "clones":   cmd_clones,
+        "excluded": cmd_excluded,
+        "clusters": cmd_clusters,
+        "freeable": cmd_freeable,
+        "sql":      cmd_sql,
+        "stats":    cmd_stats,
+        "serve":    cmd_serve,
+    }
+
+    fn = dispatch.get(args.command)
+    if fn is None:
+        parser.print_help()
+        sys.exit(1)
+    fn(args)
+
+
+if __name__ == "__main__":
+    main()
