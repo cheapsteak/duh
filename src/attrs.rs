@@ -16,8 +16,11 @@ use std::path::Path;
 
 /// Attributes for a single directory entry (or scan root).
 ///
-/// `size_blocks` is allocated bytes: `ATTR_FILE_ALLOCSIZE` for regular files
-/// (equals `st_blocks * 512` on APFS), `st_blocks * 512` via lstat otherwise.
+/// `size_blocks` is allocated bytes with `st_blocks * 512` semantics everywhere
+/// (Python parity). For regular files/symlinks it comes from `ATTR_FILE_ALLOCSIZE`,
+/// which was empirically verified equal to `st_blocks * 512` on APFS, including
+/// for decmpfs-compressed files (see comment in `parse_record`); directories and
+/// `stat_root` derive it from lstat's `st_blocks * 512` directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntryAttrs {
     pub name: OsString,
@@ -107,6 +110,11 @@ const OFF_RETURNED: usize = 4; // attribute_set_t follows the u32 length
 /// bit order (NAME, DEVID, OBJTYPE, MODTIME, FILEID) | file attrs (LINKCOUNT,
 /// TOTALSIZE, ALLOCSIZE) | forkattr (CLONEID).
 fn parse_record(rec: &[u8], dir: &Path) -> Option<EntryAttrs> {
+    // Caller (read_dir_attrs) guarantees rec.len() >= 24, so the returned-set
+    // header reads below are in bounds; keep a defensive check regardless.
+    if rec.len() < 24 {
+        return None;
+    }
     // returned attribute_set_t: commonattr, volattr, dirattr, fileattr, forkattr
     let ret_common = u32_at(rec, OFF_RETURNED);
     let ret_file = u32_at(rec, OFF_RETURNED + 12);
@@ -139,10 +147,15 @@ fn parse_record(rec: &[u8], dir: &Path) -> Option<EntryAttrs> {
     let name = if (ret_common & ATTR_CMN_NAME) != 0 {
         let at = take!(8);
         let name_off = i32_at(rec, at);
+        // The name region always follows the attrreference; a negative offset is
+        // malformed (and would overflow the unsigned arithmetic below).
+        if name_off < 0 {
+            return None;
+        }
         let name_len = u32_at(rec, at + 4) as usize; // includes trailing NUL
-        let start = (at as isize + name_off as isize) as usize;
-        let end = start + name_len.saturating_sub(1);
-        if end > rec.len() || start > end {
+        let start = at + name_off as usize;
+        let end = start.checked_add(name_len.saturating_sub(1))?;
+        if end > rec.len() {
             return None;
         }
         OsString::from_vec(rec[start..end].to_vec())
@@ -174,6 +187,12 @@ fn parse_record(rec: &[u8], dir: &Path) -> Option<EntryAttrs> {
     // File attrs: present (with valid bits) for files and symlinks; absent for
     // directories. Fall back to lstat when any are missing (Python parity — the
     // dir entry's own st_size / st_blocks).
+    //
+    // size_blocks semantics: st_blocks*512 everywhere. ATTR_FILE_ALLOCSIZE was
+    // verified to equal st_blocks*512 on APFS INCLUDING decmpfs-compressed files
+    // (ditto --hfsCompression, 4 MiB logical text file: ALLOCSIZE=36864 ==
+    // st_blocks(72)*512=36864; uncompressed twin: 4194304 == 8192*512), so the
+    // bulk value and the lstat fallback below are the same derivation.
     let want_file = ATTR_FILE_LINKCOUNT | ATTR_FILE_TOTALSIZE | ATTR_FILE_ALLOCSIZE;
     let (nlink, size_logical, size_blocks) = if (ret_file & want_file) == want_file {
         let nlink = u32_at(rec, take!(4));
@@ -250,7 +269,22 @@ pub fn read_dir_attrs(dir: &Path) -> std::io::Result<Vec<EntryAttrs>> {
         }
         let mut off = 0usize;
         for _ in 0..n {
+            // Harden against malformed/truncated records (e.g. a corrupt length
+            // from a racing filesystem): every record must hold at least its u32
+            // length + the 20-byte returned attribute_set_t, and must fit within
+            // the buffer. On violation, abandon the rest of this batch and keep
+            // what we have — a skipped entry beats a crashed scan.
+            if off + 24 > buf.len() {
+                eprintln!("duh: truncated getattrlistbulk record header; skipping rest of batch");
+                break;
+            }
             let rec_len = u32_at(&buf, off) as usize;
+            if rec_len < 24 || off + rec_len > buf.len() {
+                eprintln!(
+                    "duh: malformed getattrlistbulk record (len={rec_len} at offset {off}); skipping rest of batch"
+                );
+                break;
+            }
             let rec = &buf[off..off + rec_len];
             if debug {
                 eprintln!("duh-debug: rec_len={rec_len} bytes={:02x?}", &rec[..rec_len.min(112)]);
@@ -335,6 +369,8 @@ pub fn stat_root(path: &Path) -> std::io::Result<EntryAttrs> {
         ino: md.ino(),
         nlink: md.nlink() as u32,
         size_logical: md.size(),
+        // Same st_blocks*512 derivation as read_dir_attrs (whose ALLOCSIZE path
+        // is verified equal to this on APFS — see parse_record).
         size_blocks: md.blocks() * 512,
         mtime: md.mtime(),
         clone_id,
