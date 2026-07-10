@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 .DS_Store
 *.db
+.superpowers/
+*.sparseimage
+blackbox/__pycache__/
