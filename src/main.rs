@@ -152,9 +152,105 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let _db_path = resolve_db_path(cli.db);
 
-    // No subcommand is implemented yet; later tasks will wire each one up.
-    eprintln!("{}: not yet ported", cli.command.name());
-    ExitCode::from(2)
+    match cli.command {
+        Command::Selftest => run_selftest(),
+        // No other subcommand is implemented yet; later tasks will wire each up.
+        other => {
+            eprintln!("{}: not yet ported", other.name());
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Port of the Python oracle's `cmd_selftest` (`./duh:121-169`): create a 1 MiB
+/// random file under `~/tmp-duh-selftest/run-<millis>`, `cp -c` clone it, byte-copy
+/// it, then confirm the clone shares the source's clone_id while the copy does not.
+fn run_selftest() -> ExitCode {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn fmt(id: Option<u64>) -> String {
+        id.map_or_else(|| "None".to_string(), |n| n.to_string())
+    }
+
+    println!("Running clone-detection self-test...");
+
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let home_tmp = home.join("tmp-duh-selftest");
+    if let Err(e) = std::fs::create_dir_all(&home_tmp) {
+        eprintln!("  error: could not create {}: {e}", home_tmp.display());
+        return ExitCode::from(1);
+    }
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let tmpdir = home_tmp.join(format!("run-{millis}"));
+    if let Err(e) = std::fs::create_dir(&tmpdir) {
+        eprintln!("  error: could not create {}: {e}", tmpdir.display());
+        return ExitCode::from(1);
+    }
+
+    let src = tmpdir.join("src");
+    let clone = tmpdir.join("clone");
+    let copy = tmpdir.join("copy");
+
+    let result = (|| -> std::io::Result<ExitCode> {
+        // 1 MiB of random bytes, mirroring os.urandom(1 MiB).
+        let mut urandom = std::fs::File::open("/dev/urandom")?;
+        let mut buf = vec![0u8; 1 << 20];
+        std::io::Read::read_exact(&mut urandom, &mut buf)?;
+        std::fs::write(&src, &buf)?;
+
+        // APFS clone via `cp -c`.
+        let status = std::process::Command::new("cp")
+            .arg("-c")
+            .arg(&src)
+            .arg(&clone)
+            .status()?;
+        if !status.success() {
+            println!("  warning: cp -c returned non-zero (not on APFS?)");
+        }
+
+        // Genuine byte copy (shutil.copy2 equivalent). NOTE: std::fs::copy uses
+        // macOS copyfile(), which CLONES on APFS — that would make the "copy"
+        // share the source's clone_id. Writing the buffer to a fresh file
+        // allocates independent blocks, matching Python's userspace read/write.
+        std::fs::write(&copy, &buf)?;
+
+        let src_id = duh::attrs::get_clone_id(&src);
+        let clone_id = duh::attrs::get_clone_id(&clone);
+        let copy_id = duh::attrs::get_clone_id(&copy);
+
+        println!("  src   clone_id = {}", fmt(src_id));
+        println!("  clone clone_id = {}", fmt(clone_id));
+        println!("  copy  clone_id = {}", fmt(copy_id));
+
+        let ok_clone = src_id.is_some() && src_id == clone_id;
+        let ok_copy = copy_id.is_none() || copy_id != src_id;
+
+        if ok_clone && ok_copy {
+            println!("  PASS: src and clone share clone_id; copy has different clone_id");
+            Ok(ExitCode::SUCCESS)
+        } else if !ok_clone {
+            println!("  FAIL: src and clone do NOT share clone_id — FFI plumbing issue");
+            Ok(ExitCode::from(1))
+        } else {
+            println!(
+                "  WARN: copy has same clone_id as src ({}) — unexpected",
+                fmt(copy_id)
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+    })();
+
+    // Cleanup (best-effort), mirroring the Python `finally` block.
+    let _ = std::fs::remove_dir_all(&tmpdir);
+    let _ = std::fs::remove_dir(&home_tmp);
+
+    result.unwrap_or_else(|e| {
+        eprintln!("  error: {e}");
+        ExitCode::from(1)
+    })
 }
 
 #[cfg(test)]
