@@ -909,7 +909,211 @@ pub fn cmd_marginal(con: &Connection, path: &str, json: bool) -> rusqlite::Resul
     println!("  {:<24} {:>12}", "Files:", commafy(result.file_count));
     println!("  {:<24} {:>12}", "Dirs:", commafy(result.dir_count));
 
+    print_marginal_leaks(con, root_id)?;
+
     Ok(ExitCode::SUCCESS)
+}
+
+/// One external-leak candidate: a family with members outside the target
+/// subtree. Mirrors the reference's 6-tuple `(fid, blocks_ext, clone_id, dev,
+/// ino, nlinks)`; nlinks is carried by the reference but never printed.
+struct LeakCand {
+    fid: i64,
+    blocks_ext: f64,
+    clone_id: Option<i64>,
+    dev: i64,
+    ino: i64,
+}
+
+/// Port of the external-leaks section of `cmd_marginal` (`./duh:1100-1217`):
+/// families (clone or hardlink) with members outside the target get an
+/// approximate outside-blocks figure, top 5 printed. The reference computes
+/// this even in `--json` mode but never includes it in the JSON output, so the
+/// Rust port only runs it on the text path (observably identical).
+fn print_marginal_leaks(con: &Connection, root_id: i64) -> rusqlite::Result<()> {
+    // Re-run the inside query (the reference re-queries rather than reusing
+    // `_compute_marginal_freeable`'s pass).
+    let inside_sql = format!(
+        "{DESC_CTE} SELECT f.id, f.dev, f.ino, f.clone_id, f.nlinks, f.size_blocks \
+         FROM files f JOIN desc_ids d ON f.id = d.id WHERE f.is_dir = 0"
+    );
+    // Member tuple: (id, nlinks, size_blocks).
+    type Member = (i64, i64, i64);
+    let mut inside_ids: HashSet<i64> = HashSet::new();
+    // Python dicts preserve insertion order, and that order feeds the stable
+    // sort below — so group with first-seen-ordered Vecs, not a bare HashMap.
+    let mut clone_grp: Vec<(i64, Vec<Member>)> = Vec::new();
+    let mut clone_idx: HashMap<i64, usize> = HashMap::new();
+    let mut hl_grp: Vec<((i64, i64), Vec<Member>)> = Vec::new();
+    let mut hl_idx: HashMap<(i64, i64), usize> = HashMap::new();
+    {
+        let mut stmt = con.prepare(&inside_sql)?;
+        let rows = stmt.query_map([root_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, dev, ino, cid, nlinks, blk) = row?;
+            inside_ids.insert(id);
+            if let Some(c) = cid {
+                let i = *clone_idx.entry(c).or_insert_with(|| {
+                    clone_grp.push((c, Vec::new()));
+                    clone_grp.len() - 1
+                });
+                clone_grp[i].1.push((id, nlinks, blk));
+            } else if nlinks > 1 {
+                let i = *hl_idx.entry((dev, ino)).or_insert_with(|| {
+                    hl_grp.push(((dev, ino), Vec::new()));
+                    hl_grp.len() - 1
+                });
+                hl_grp[i].1.push((id, nlinks, blk));
+            }
+        }
+    }
+
+    // Global clone counts (batched IN queries of 500, as in the reference).
+    let mut global: HashMap<i64, i64> = HashMap::new();
+    if !clone_grp.is_empty() {
+        let cids: Vec<i64> = clone_grp.iter().map(|(c, _)| *c).collect();
+        for batch in cids.chunks(500) {
+            let placeholders = vec!["?"; batch.len()].join(",");
+            let sql = format!(
+                "SELECT clone_id, COUNT(*) FROM files WHERE clone_id IN ({placeholders}) GROUP BY clone_id"
+            );
+            let mut stmt = con.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(batch.iter()), |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (cid, cnt) = row?;
+                global.insert(cid, cnt);
+            }
+        }
+    }
+
+    // Collect leak candidates: families with members outside. Clone families
+    // first, then hardlink families — the reference appends in that order and
+    // relies on stable sort to keep ties in insertion order.
+    let mut cands: Vec<LeakCand> = Vec::new();
+    for (cid, members) in &clone_grp {
+        let inside_cnt = members.len() as i64;
+        let total_cnt = global.get(cid).copied().unwrap_or(inside_cnt);
+        if inside_cnt < total_cnt {
+            // Some members outside — approximate blocks held outside.
+            let max_blk = members.iter().map(|m| m.2).max().unwrap_or(0);
+            let frac_outside = (total_cnt - inside_cnt) as f64 / total_cnt as f64;
+            cands.push(LeakCand {
+                fid: members[0].0,
+                blocks_ext: max_blk as f64 * frac_outside,
+                clone_id: Some(*cid),
+                dev: 0,
+                ino: 0,
+            });
+        }
+    }
+    for ((dev, ino), members) in &hl_grp {
+        let nlinks = members[0].1;
+        let inside_cnt = members.len() as i64;
+        if inside_cnt < nlinks {
+            let blk = members[0].2;
+            let frac_outside = (nlinks - inside_cnt) as f64 / nlinks as f64;
+            cands.push(LeakCand {
+                fid: members[0].0,
+                blocks_ext: blk as f64 * frac_outside,
+                clone_id: None,
+                dev: *dev,
+                ino: *ino,
+            });
+        }
+    }
+    // Stable sort descending by blocks_ext (Python `sort(key=..., reverse=True)`
+    // keeps ties in insertion order; so does Vec::sort_by).
+    cands.sort_by(|a, b| {
+        b.blocks_ext
+            .partial_cmp(&a.blocks_ext)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    cands.truncate(5);
+
+    if cands.is_empty() {
+        return Ok(());
+    }
+
+    println!();
+    println!("  Blocks shared with paths OUTSIDE this directory (top 5):");
+    let home = std::env::var("HOME").unwrap_or_default();
+    let shorten = |p: &str| -> String {
+        if !home.is_empty() && p.starts_with(&home) {
+            p.replacen(&home, "~", 1)
+        } else {
+            p.to_string()
+        }
+    };
+    // os.path.dirname for the normalized absolute paths full_path produces.
+    fn dirname(p: &str) -> &str {
+        match p.rfind('/') {
+            None => "",
+            Some(0) => "/",
+            Some(i) => &p[..i],
+        }
+    }
+
+    for cand in &cands {
+        let fpath = full_path(con, cand.fid)?;
+        let short_fpath = shorten(&fpath);
+
+        // External family members (ids outside the target subtree).
+        let ext_ids: Vec<i64> = if let Some(cid) = cand.clone_id {
+            // The reference collects the family into a set, subtracts
+            // inside_id_set, and takes the first 10. CPython's small-int set
+            // iteration approximates ascending order; sort to match.
+            let mut stmt = con.prepare("SELECT id FROM files WHERE clone_id = ? AND id != ?")?;
+            let rows = stmt.query_map(params![cid, cand.fid], |r| r.get::<_, i64>(0))?;
+            let mut ext: Vec<i64> = rows
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|id| !inside_ids.contains(id))
+                .collect();
+            ext.sort_unstable();
+            ext.dedup();
+            ext.truncate(10);
+            ext
+        } else {
+            // Hardlink branch keeps query order (the reference filters a list).
+            let mut stmt = con
+                .prepare("SELECT id FROM files WHERE dev = ? AND ino = ? AND nlinks > 1 AND id != ?")?;
+            let rows = stmt.query_map(params![cand.dev, cand.ino, cand.fid], |r| r.get::<_, i64>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|id| !inside_ids.contains(id))
+                .collect()
+        };
+
+        // Distinct parent dirs of the first 5 external members, sorted, top 2.
+        let mut ext_dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for &eid in ext_ids.iter().take(5) {
+            ext_dirs.insert(shorten(dirname(&full_path(con, eid)?)));
+        }
+        let ext_summary = ext_dirs
+            .iter()
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "    {:>10}  {}  → {}",
+            fmt_bytes(cand.blocks_ext as i64),
+            short_fpath,
+            ext_summary
+        );
+    }
+    Ok(())
 }
 
 #[derive(serde::Serialize)]
