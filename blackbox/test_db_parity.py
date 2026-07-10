@@ -1,14 +1,13 @@
 import subprocess
-import pathlib
 
 import db_diff
-from conftest import REPO, run_duh, DUH_BIN
+from conftest import REPO
 
 
 def test_rust_scan_matches_python_scan(fixture_tree, tmp_path):
     py_bin = REPO / "duh"           # after Task 16: REPO / "reference/duh-py"
     rs_bin = REPO / "target/release/duh"
-    if not rs_bin.exists() or DUH_BIN == py_bin:
+    if not rs_bin.exists():
         import pytest; pytest.skip("rust binary not built")
     dbs = {}
     for label, binary in (("py", py_bin), ("rs", rs_bin)):
