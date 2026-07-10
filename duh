@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""dskdb v2 — macOS APFS-aware disk-usage database CLI.
+"""duh v2 — macOS APFS-aware disk-usage database CLI.
 
 Detects hardlinks AND APFS clones (via getattrlist ATTR_CMNEXT_CLONEID).
 macOS-only. stdlib only.
@@ -33,13 +33,13 @@ from pathlib import Path
 # Platform check
 # ---------------------------------------------------------------------------
 if sys.platform != "darwin":
-    sys.exit("error: dskdb is macOS-only")
+    sys.exit("error: duh is macOS-only")
 
 # ---------------------------------------------------------------------------
 # DB path
 # ---------------------------------------------------------------------------
-_DEFAULT_DB = os.path.expanduser("~/.local/share/dskdb/scan.db")
-DB_PATH = os.environ.get("DSKDB_DB", _DEFAULT_DB)
+_DEFAULT_DB = os.path.expanduser("~/.local/share/duh/scan.db")
+DB_PATH = os.environ.get("DUH_DB", _DEFAULT_DB)
 
 # ---------------------------------------------------------------------------
 # getattrlist ctypes binding (unchanged from v1)
@@ -123,7 +123,7 @@ def cmd_selftest(_args: argparse.Namespace) -> None:
     import shutil
     print("Running clone-detection self-test...")
 
-    home_tmp = os.path.join(os.path.expanduser("~"), "tmp-dskdb-selftest")
+    home_tmp = os.path.join(os.path.expanduser("~"), "tmp-duh-selftest")
     os.makedirs(home_tmp, exist_ok=True)
     import time as _time
     tmpdir = os.path.join(home_tmp, f"run-{int(_time.time() * 1000)}")
@@ -850,11 +850,11 @@ def cmd_top(args: argparse.Namespace) -> None:
         under = os.path.realpath(under)
         root_id = resolve_path_to_id(con, under)
         if root_id is None:
-            sys.exit(f"error: path not found in DB: {under}\nRun `dskdb scan` first.")
+            sys.exit(f"error: path not found in DB: {under}\nRun `duh scan` first.")
     else:
         scan = con.execute("SELECT root FROM scans ORDER BY id DESC LIMIT 1").fetchone()
         if not scan:
-            sys.exit("error: no scans found. Run `dskdb scan <path>` first.")
+            sys.exit("error: no scans found. Run `duh scan <path>` first.")
         under = scan["root"]
         root_id = resolve_path_to_id(con, under)
         if root_id is None:
@@ -1088,7 +1088,7 @@ def cmd_marginal(args: argparse.Namespace) -> None:
 
     root_id = resolve_path_to_id(con, path)
     if root_id is None:
-        sys.exit(f"error: no data for path {path} — run `dskdb scan` first")
+        sys.exit(f"error: no data for path {path} — run `duh scan` first")
 
     result = _compute_marginal_freeable(con, root_id)
     strict_blocks    = result["strict_bytes"]
@@ -1227,7 +1227,7 @@ def cmd_file(args: argparse.Namespace) -> None:
 
     file_id = resolve_path_to_id(con, path)
     if file_id is None:
-        sys.exit(f"error: file not in DB: {path}\nRun `dskdb scan` on the containing directory first.")
+        sys.exit(f"error: file not in DB: {path}\nRun `duh scan` on the containing directory first.")
 
     row = con.execute("SELECT * FROM files WHERE id = ?", (file_id,)).fetchone()
     if not row:
@@ -1431,10 +1431,10 @@ CREATE TEMP VIEW IF NOT EXISTS v_excluded AS
 def cmd_sql(_args: argparse.Namespace) -> None:
     db_path = DB_PATH
     if not os.path.exists(db_path):
-        sys.exit(f"error: DB not found: {db_path}\nRun `dskdb scan <path>` first.")
+        sys.exit(f"error: DB not found: {db_path}\nRun `duh scan <path>` first.")
 
     import tempfile
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".sql", delete=False, prefix="dskdb-init-") as f:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".sql", delete=False, prefix="duh-init-") as f:
         f.write(_VIEWS_SQL)
         init_file = f.name
 
@@ -1455,10 +1455,10 @@ def cmd_stats(_args: argparse.Namespace) -> None:
         "SELECT * FROM scans ORDER BY id DESC LIMIT 1"
     ).fetchone()
     if not scan:
-        print("No scans found. Run `dskdb scan <path>` first.")
+        print("No scans found. Run `duh scan <path>` first.")
         return
 
-    print("=== dskdb stats (v2) ===")
+    print("=== duh stats (v2) ===")
     print()
     print(f"  Last scan root:    {scan['root']}")
     scanned_at = time.ctime(scan["started_at"])
@@ -2288,7 +2288,7 @@ _HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>dskdb — disk explorer</title>
+<title>duh — disk explorer</title>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 body {
@@ -2777,8 +2777,8 @@ _HTML_BYTES = _HTML_PAGE.encode("utf-8")
 
 # --------------- HTTP handler -----------------------------------------------
 
-class _DskdbHandler(BaseHTTPRequestHandler):
-    """Handles all HTTP requests for the dskdb serve UI."""
+class _DuhHandler(BaseHTTPRequestHandler):
+    """Handles all HTTP requests for the duh serve UI."""
 
     # These are set as class attributes by cmd_serve before the server starts
     db_path: str = ""
@@ -2977,11 +2977,11 @@ def cmd_serve(args: argparse.Namespace) -> None:
     path_cache = _PathCache(DB_PATH)
 
     # Set class-level state on handler (safe: single server, class used as singleton)
-    _DskdbHandler.db_path = DB_PATH
-    _DskdbHandler.dir_agg = dir_agg
-    _DskdbHandler.path_cache = path_cache
-    _DskdbHandler.freeable_map = freeable_map
-    _DskdbHandler.locked_here_map = locked_here_map
+    _DuhHandler.db_path = DB_PATH
+    _DuhHandler.dir_agg = dir_agg
+    _DuhHandler.path_cache = path_cache
+    _DuhHandler.freeable_map = freeable_map
+    _DuhHandler.locked_here_map = locked_here_map
 
     # Find an available port
     port = args.port
@@ -2989,7 +2989,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
     server = None
     while port < max_port:
         try:
-            server = ThreadingHTTPServer(("127.0.0.1", port), _DskdbHandler)
+            server = ThreadingHTTPServer(("127.0.0.1", port), _DuhHandler)
             break
         except OSError:
             port += 1
@@ -3081,7 +3081,7 @@ def cmd_freeable(args: argparse.Namespace) -> None:
 
     node_id = resolve_path_to_id(con, path)
     if node_id is None:
-        sys.exit(f"error: path not in DB: {path}\nRun `dskdb scan` first.")
+        sys.exit(f"error: path not in DB: {path}\nRun `duh scan` first.")
 
     freeable_map, locked_here_map = compute_freeable(con)
 
@@ -3097,10 +3097,10 @@ def cmd_freeable(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="dskdb",
+        prog="duh",
         description="macOS APFS-aware disk-usage database (v2). Detects clones and hardlinks.",
     )
-    p.add_argument("--db", default=None, help="Override DB path (or set DSKDB_DB env var)")
+    p.add_argument("--db", default=None, help="Override DB path (or set DUH_DB env var)")
     sub = p.add_subparsers(dest="command", required=True)
 
     # selftest

@@ -1,7 +1,8 @@
-# dskdb
+# duh — du, honest
 
-APFS-clone-aware disk usage analyzer for macOS. It measures what deleting a
-directory would *actually* free — not what per-file sizes add up to.
+`du` sums per-file sizes. On APFS, clones make that a lie: a directory can
+"contain" 20 GB and free 3 MB when you delete it. `duh` is a macOS disk usage
+analyzer that reports what deleting actually frees.
 
 ## The problem
 
@@ -10,15 +11,14 @@ But APFS clones — created by `clonefile(2)`, i.e. `cp -c`, and used heavily by
 tools like pnpm, uv, Postgres's `FILE_COPY` clone-based database branching,
 and git-worktree-heavy setups — report their **full** size on every clone
 while sharing physical blocks on disk. A directory tree full of clones can
-overstate its real disk cost by 10–100x. You can delete a "20 GB" folder and
-get 3 MB back.
+overstate its real disk cost by 10–100x.
 
 Hardlinks have the mirror problem: several paths, one set of blocks.
 
 The only ground truth is the volume's allocated-block count (what `df`
-reports) — and `df` attributes nothing to folders. dskdb bridges that gap.
+reports) — and `df` attributes nothing to folders. duh bridges that gap.
 
-## What dskdb does
+## What duh does
 
 - **Scans** a directory tree into a SQLite database. The design is
   memory-bounded and streaming; trees of ~4 million files are fine.
@@ -36,7 +36,7 @@ reports) — and `df` attributes nothing to folders. dskdb bridges that gap.
 ## The treemap UI
 
 ```
-./dskdb serve
+./duh serve
 ```
 
 opens http://127.0.0.1:7777/ — a zoomable treemap with three size modes:
@@ -52,19 +52,19 @@ rather than being silently attributed to one of them.
 
 ```sh
 # 1. Verify clone detection works on your filesystem
-./dskdb selftest
+./duh selftest
 
 # 2. Scan (this can take a while on a large home directory)
-./dskdb scan ~
+./duh scan ~
 
 # 3. Ask questions
-./dskdb freeable ~/some/dir     # what would rm -rf actually free?
-./dskdb top --under ~ -d 2      # biggest directories
-./dskdb clones                  # clone families ranked by apparent "waste"
-./dskdb clusters                # delete-together groups
+./duh freeable ~/some/dir     # what would rm -rf actually free?
+./duh top --under ~ -d 2      # biggest directories
+./duh clones                  # clone families ranked by apparent "waste"
+./duh clusters                # delete-together groups
 
 # 4. Or explore visually
-./dskdb serve
+./duh serve
 ```
 
 Useful knobs:
@@ -72,13 +72,13 @@ Useful knobs:
 - `--exclude NAME` adds a directory name to the skip list; a default list
   already skips regenerable trees (`node_modules`, `.venv`, `__pycache__`,
   `.git/objects`, Rust `target`, etc.). `--include NAME` removes a default;
-  `--no-default-excludes` disables the list. `./dskdb excluded` shows what
+  `--no-default-excludes` disables the list. `./duh excluded` shows what
   was skipped and how big it was.
 - `--min-free GIB` aborts a scan if the volume's free space drops below the
   threshold (default 3 GiB) — a guard against the scan's own DB growth on a
   nearly-full disk.
-- The database lives at `~/.local/share/dskdb/scan.db`; override with the
-  `DSKDB_DB` environment variable or `--db`.
+- The database lives at `~/.local/share/duh/scan.db`; override with the
+  `DUH_DB` environment variable or `--db`.
 
 Other subcommands: `marginal PATH`, `file PATH`, `stats`, and `sql` (opens
 the database in `sqlite3` with convenience views).
@@ -97,7 +97,7 @@ the database in `sqlite3` with convenience views).
 - **`ATTR_CMNEXT_CLONEID` is `0x100`, not the documented `0x40`.** Apple's
   headers/docs suggest `0x40`, but empirically on current macOS the attribute
   is returned for bit `0x100`. The constant in this script is the empirically
-  correct one; the self-test (`./dskdb selftest`) verifies it end-to-end by
+  correct one; the self-test (`./duh selftest`) verifies it end-to-end by
   creating a real clone and a real copy and checking their clone IDs.
 - **Sparse files** (e.g. a Docker `Docker.raw`) are counted by allocated
   blocks, not logical size — a "64 GB" sparse image that occupies 9 GB counts
@@ -105,8 +105,8 @@ the database in `sqlite3` with convenience views).
   what Finder shows.
 - **The SQLite file never shrinks between rescans.** Deleted rows leave free
   pages that get reused, but the file itself only grows. If you want the
-  space back, delete the DB (`rm ~/.local/share/dskdb/scan.db`) or run
-  `VACUUM` via `./dskdb sql`.
+  space back, delete the DB (`rm ~/.local/share/duh/scan.db`) or run
+  `VACUUM` via `./duh sql`.
 - Freeable numbers are relative to the scanned root: a clone family member
   *outside* anything you scanned can't be seen, so its family may look
   fully-freeable when it isn't. Scan the broadest root you care about.
