@@ -188,6 +188,9 @@ fn open_thread_con(db_path: &Path) -> rusqlite::Result<Connection> {
     )?;
     con.pragma_update(None, "query_only", "ON")?;
     con.pragma_update(None, "cache_size", -262144)?;
+    // Wait instead of instantly failing SQLITE_BUSY during a concurrent scan
+    // (matches Python's sqlite3 default busy timeout).
+    con.busy_timeout(std::time::Duration::from_secs(5))?;
     Ok(con)
 }
 

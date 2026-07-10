@@ -62,10 +62,11 @@ fn basename(p: &str) -> String {
 }
 
 /// `~`-shorten a path the way every report command does:
-/// `path.replace(os.path.expanduser("~"), "~")` (Python `str.replace` — first
-/// occurrence anywhere, but `full_path` output is always an absolute path so
-/// in practice this only ever fires on the leading prefix, same effective
-/// result as `replacen(..., 1)`).
+/// `path.replace(os.path.expanduser("~"), "~")` — Python's `str.replace`
+/// rewrites *every* occurrence anywhere in the path, including a `$HOME`
+/// substring in the middle. This is an accepted deviation: we replace only the
+/// leading prefix, which is deliberately saner (a mid-path `$HOME` is almost
+/// always coincidental and should not be mangled).
 fn shorten<'a>(home: &str, p: &'a str) -> std::borrow::Cow<'a, str> {
     if !home.is_empty() && p.starts_with(home) {
         std::borrow::Cow::Owned(p.replacen(home, "~", 1))

@@ -6,7 +6,8 @@ import sys
 from collections import defaultdict
 
 FIELDS = ("is_dir", "is_symlink", "is_excluded", "ino", "nlinks",
-          "size_logical", "size_blocks", "excluded_file_count")
+          "size_logical", "size_blocks", "excluded_file_count",
+          "dev", "mtime")
 
 
 def load(db):

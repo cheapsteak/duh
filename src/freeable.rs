@@ -139,14 +139,18 @@ fn load_cache(con: &Connection, scan_id: i64) -> rusqlite::Result<Option<Freeabl
 }
 
 /// Write freeable results to `freeable_cache`, clearing stale rows for other
-/// scan_ids first. Only non-zero rows are persisted (union of both maps).
+/// scan_ids first. Only non-zero rows are persisted (union of both maps). The
+/// stale-row DELETE and all INSERTs run inside a single transaction, matching
+/// the oracle (`reference/duh-py:1606-1651`): the cache is written atomically or
+/// not at all.
 fn persist_cache(
     con: &Connection,
     scan_id: i64,
     freeable: &HashMap<i64, u64>,
     locked_here: &HashMap<i64, u64>,
 ) -> rusqlite::Result<()> {
-    con.execute(
+    let tx = con.unchecked_transaction()?;
+    tx.execute(
         "DELETE FROM freeable_cache WHERE scan_id != ?",
         [scan_id],
     )?;
@@ -154,18 +158,20 @@ fn persist_cache(
     all_ids.extend(freeable.keys());
     all_ids.extend(locked_here.keys());
 
-    let mut stmt = con.prepare(
-        "INSERT OR REPLACE INTO freeable_cache (node_id, freeable, locked_here, scan_id) \
-         VALUES (?,?,?,?)",
-    )?;
-    for nid in all_ids {
-        let f = freeable.get(&nid).copied().unwrap_or(0);
-        let lh = locked_here.get(&nid).copied().unwrap_or(0);
-        if f != 0 || lh != 0 {
-            stmt.execute(params![nid, f as i64, lh as i64, scan_id])?;
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR REPLACE INTO freeable_cache (node_id, freeable, locked_here, scan_id) \
+             VALUES (?,?,?,?)",
+        )?;
+        for nid in all_ids {
+            let f = freeable.get(&nid).copied().unwrap_or(0);
+            let lh = locked_here.get(&nid).copied().unwrap_or(0);
+            if f != 0 || lh != 0 {
+                stmt.execute(params![nid, f as i64, lh as i64, scan_id])?;
+            }
         }
     }
-    Ok(())
+    tx.commit()
 }
 
 // ---------------------------------------------------------------------------
@@ -514,9 +520,13 @@ pub fn compute(con: &Connection) -> rusqlite::Result<FreeableMaps> {
         }
     }
 
-    // Phase 10: persist.
+    // Phase 10: persist. A persist failure (locked/read-only DB) is downgraded
+    // to a stderr warning, matching the oracle: the freeable numbers must still
+    // print even when the cache cannot be written.
     if let Some(sid) = scan_id {
-        persist_cache(con, sid, &freeable, &locked_here)?;
+        if let Err(e) = persist_cache(con, sid, &freeable, &locked_here) {
+            eprintln!("[freeable] warning: could not write cache: {e}");
+        }
     }
 
     Ok((freeable, locked_here))
@@ -1087,8 +1097,9 @@ fn print_marginal_leaks(con: &Connection, root_id: i64) -> rusqlite::Result<()> 
         // External family members (ids outside the target subtree).
         let ext_ids: Vec<i64> = if let Some(cid) = cand.clone_id {
             // The reference collects the family into a set, subtracts
-            // inside_id_set, and takes the first 10. CPython's small-int set
-            // iteration approximates ascending order; sort to match.
+            // inside_id_set, and takes the first 10. Accepted deviation:
+            // reference uses CPython set iteration order; we use ascending ids
+            // (differs only for families with >= 6 external members).
             let mut stmt = con.prepare("SELECT id FROM files WHERE clone_id = ? AND id != ?")?;
             let rows = stmt.query_map(params![cid, cand.fid], |r| r.get::<_, i64>(0))?;
             let mut ext: Vec<i64> = rows

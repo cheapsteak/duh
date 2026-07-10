@@ -77,6 +77,9 @@ pub fn open(path: &Path) -> rusqlite::Result<Connection> {
         std::fs::create_dir_all(dir).ok();
     }
     let con = Connection::open(path)?;
+    // Wait up to 5s on a locked DB rather than failing instantly with
+    // SQLITE_BUSY (matches Python's sqlite3 default busy timeout).
+    con.busy_timeout(std::time::Duration::from_secs(5))?;
     con.pragma_update(None, "journal_mode", "WAL")?;
     con.pragma_update(None, "synchronous", "NORMAL")?;
     con.pragma_update(None, "foreign_keys", "ON")?;
