@@ -1,0 +1,39 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: macos-14   # APFS + Apple Silicon; hdiutil available for gold tests
+    timeout-minutes: 30 # cap so a hung hdiutil/df poll can't burn the whole runner budget
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # setup-python gives us a pip-installable interpreter without hitting
+      # the PEP 668 "externally-managed-environment" guard that Homebrew's
+      # system python3 enforces on macos-14 runners.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: cargo test --release
+      - run: cargo build --release
+
+      - name: install pytest
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pytest || python3 -m pip install --user --break-system-packages pytest
+
+      # NOTE (Task 16 coupling): the python oracle currently lives at repo
+      # root ./duh. Task 16 moves it to reference/ and updates
+      # blackbox/test_db_parity.py's py_bin path accordingly. Nothing here
+      # references the oracle path directly (DUH_BIN only points at the rust
+      # binary), so this workflow needs no change when that move happens.
+      - name: black-box suite vs rust
+        run: DUH_BIN=$PWD/target/release/duh python3 -m pytest blackbox/ -q
+
+      - name: gold tests vs rust
+        run: DUH_BIN=$PWD/target/release/duh python3 -m pytest blackbox/ -m slow -q
+
+      - name: parity vs python reference
+        run: python3 -m pytest blackbox/test_db_parity.py -q
