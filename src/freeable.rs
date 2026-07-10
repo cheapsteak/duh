@@ -764,12 +764,12 @@ pub fn cmd_freeable(con: &Connection, path: &str, json: bool) -> rusqlite::Resul
 // `./duh:972-1078`)
 // ---------------------------------------------------------------------------
 
-struct MarginalResult {
-    strict_bytes: i64,
-    apparent_bytes: i64,
-    total_blocks: i64,
-    file_count: i64,
-    dir_count: i64,
+pub(crate) struct MarginalResult {
+    pub(crate) strict_bytes: i64,
+    pub(crate) apparent_bytes: i64,
+    pub(crate) total_blocks: i64,
+    pub(crate) file_count: i64,
+    pub(crate) dir_count: i64,
 }
 
 pub(crate) const DESC_CTE: &str = "WITH RECURSIVE desc_ids(id) AS ( \
@@ -777,7 +777,10 @@ pub(crate) const DESC_CTE: &str = "WITH RECURSIVE desc_ids(id) AS ( \
     UNION ALL \
     SELECT f.id FROM files f JOIN desc_ids d ON f.parent_id = d.id ) ";
 
-fn compute_marginal_freeable(con: &Connection, root_id: i64) -> rusqlite::Result<MarginalResult> {
+pub(crate) fn compute_marginal_freeable(
+    con: &Connection,
+    root_id: i64,
+) -> rusqlite::Result<MarginalResult> {
     // Counts (apparent, total_blocks, file_count, dir_count).
     let counts_sql = format!(
         "{DESC_CTE} SELECT \

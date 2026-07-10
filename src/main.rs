@@ -130,25 +130,6 @@ enum Command {
     },
 }
 
-impl Command {
-    fn name(&self) -> &'static str {
-        match self {
-            Command::Selftest => "selftest",
-            Command::Scan { .. } => "scan",
-            Command::Top { .. } => "top",
-            Command::Marginal { .. } => "marginal",
-            Command::File { .. } => "file",
-            Command::Clones { .. } => "clones",
-            Command::Excluded { .. } => "excluded",
-            Command::Clusters { .. } => "clusters",
-            Command::Freeable { .. } => "freeable",
-            Command::Sql => "sql",
-            Command::Stats => "stats",
-            Command::Serve { .. } => "serve",
-        }
-    }
-}
-
 /// Resolve the DB path: `--db` flag > `DUH_DB` env var > `~/.local/share/duh/scan.db`.
 fn resolve_db_path(db_flag: Option<PathBuf>) -> PathBuf {
     db_flag.unwrap_or_else(duh::db::default_db_path)
@@ -205,11 +186,7 @@ fn main() -> ExitCode {
         }),
         Command::Stats => run_with_db(&db_path, duh::reports::cmd_stats),
         Command::Sql => duh::reports::cmd_sql(&db_path),
-        // Serve (Phase 4 / web UI) is not yet ported.
-        other => {
-            eprintln!("{}: not yet ported", other.name());
-            ExitCode::from(2)
-        }
+        Command::Serve { port, no_browser } => duh::serve::run(&db_path, port, no_browser),
     }
 }
 
