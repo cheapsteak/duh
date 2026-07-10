@@ -76,3 +76,38 @@ def test_dns_rebinding_rejected(server):
     with pytest.raises(urllib.error.HTTPError) as e:
         _get(f"{server}/api/root", host="evil.example.com")
     assert e.value.code == 403
+
+
+@rust_only
+def test_missing_host_rejected(server):
+    """Host guard fails closed: a request without any Host header gets 403.
+
+    urllib always adds a Host header, so speak raw HTTP over a socket.
+    """
+    port = int(server.rsplit(":", 1)[1])
+    with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+        s.settimeout(5)
+        s.sendall(b"GET /api/root HTTP/1.0\r\n\r\n")
+        resp = b""
+        while b"\r\n" not in resp:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            resp += chunk
+    status_line = resp.split(b"\r\n", 1)[0].decode()
+    assert status_line.split()[1] == "403", status_line
+
+
+@rust_only
+def test_static_asset_content_types(server):
+    expected = {
+        "/style.css": "text/css",
+        "/app.js": "application/javascript",
+        "/vendor/echarts.min.js": "application/javascript",
+    }
+    for path, ctype in expected.items():
+        resp = _get(f"{server}{path}")
+        assert resp.status == 200, path
+        assert resp.headers["Content-Type"].startswith(ctype), (
+            path, resp.headers["Content-Type"])
+        assert resp.read(), path  # non-empty body

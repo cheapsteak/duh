@@ -150,7 +150,21 @@ fn worker(server: &Server, state: &State) {
         }
     };
     for req in server.incoming_requests() {
-        let (status, body, content_type) = route(&con, state, req.url(), req.headers());
+        // Compute the response inside catch_unwind so a panicking handler can't
+        // kill this worker and permanently shrink the pool. AssertUnwindSafe is
+        // sound here: the closure only borrows `con` (read-only connection;
+        // rusqlite finalizes statements during unwinding) and `state`, whose
+        // sole interior mutability is the path-cache Mutex — that Mutex poisons
+        // on panic and `path_for` recovers the poison explicitly, and cache
+        // entries are complete Strings inserted atomically, so no handler can
+        // observe a broken invariant after a panic.
+        let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            route(&con, state, req.url(), req.headers())
+        }));
+        let (status, body, content_type) = dispatched.unwrap_or_else(|_| {
+            eprintln!("[serve] handler panicked; responding 500");
+            json_response(&json!({"error": "internal error"}), 500)
+        });
         let header = Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes())
             .expect("valid content-type header");
         let response = Response::new(
@@ -177,15 +191,15 @@ fn open_thread_con(db_path: &Path) -> rusqlite::Result<Connection> {
     Ok(con)
 }
 
-/// Allowed `Host` header values for the DNS-rebinding guard.
+/// Allowed `Host` header values for the DNS-rebinding guard. Fails closed: an
+/// absent or empty Host header is rejected. Hostname comparison is
+/// case-insensitive (RFC 4343), so e.g. `LOCALHOST:7777` is accepted.
 fn host_allowed(host: &str) -> bool {
-    if host.is_empty() {
-        return true; // no Host header (local CLI tools) — treat as local
-    }
     let h = match host.split_once(':') {
         Some((h, _port)) => h,
         None => host,
     };
+    let h = h.to_ascii_lowercase();
     h == "localhost" || h == "127.0.0.1"
 }
 
@@ -430,12 +444,19 @@ fn api_breadcrumb(con: &Connection, node_id: i64) -> ApiResult {
 }
 
 /// Memoized full path for a node id (port of `_PathCache.get`).
+///
+/// A poisoned lock is recovered with `into_inner()`: cache entries are complete
+/// Strings inserted atomically under the lock, so a panic elsewhere can never
+/// leave the map in a half-written state.
 fn path_for(con: &Connection, state: &State, id: i64) -> rusqlite::Result<String> {
-    if let Some(p) = state.path_cache.lock().unwrap().get(&id) {
+    fn lock(state: &State) -> std::sync::MutexGuard<'_, HashMap<i64, String>> {
+        state.path_cache.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    if let Some(p) = lock(state).get(&id) {
         return Ok(p.clone());
     }
     let path = freeable::full_path(con, id)?;
-    state.path_cache.lock().unwrap().insert(id, path.clone());
+    lock(state).insert(id, path.clone());
     Ok(path)
 }
 
@@ -558,11 +579,12 @@ mod tests {
 
     #[test]
     fn host_guard_allows_local_and_rejects_others() {
-        assert!(host_allowed(""));
         assert!(host_allowed("localhost"));
         assert!(host_allowed("localhost:7777"));
+        assert!(host_allowed("LOCALHOST:7777")); // hostnames are case-insensitive
         assert!(host_allowed("127.0.0.1"));
         assert!(host_allowed("127.0.0.1:65000"));
+        assert!(!host_allowed("")); // absent/empty Host fails closed
         assert!(!host_allowed("evil.example.com"));
         assert!(!host_allowed("evil.example.com:7777"));
         assert!(!host_allowed("169.254.1.1"));
