@@ -178,10 +178,37 @@ fn main() -> ExitCode {
             },
             &db_path,
         ),
+        Command::Freeable { path } => run_with_db(&db_path, |con| duh::freeable::cmd_freeable(con, &path)),
+        Command::Marginal { path, json } => {
+            run_with_db(&db_path, |con| duh::freeable::cmd_marginal(con, &path, json))
+        }
+        Command::File { path } => run_with_db(&db_path, |con| duh::freeable::cmd_file(con, &path)),
         // No other subcommand is implemented yet; later tasks will wire each up.
         other => {
             eprintln!("{}: not yet ported", other.name());
             ExitCode::from(2)
+        }
+    }
+}
+
+/// Open the DB read/write and run `f`, mapping any sqlite error to a
+/// stderr message + exit 1 (the reference's `sys.exit` behaviour).
+fn run_with_db<F>(db_path: &std::path::Path, f: F) -> ExitCode
+where
+    F: FnOnce(&rusqlite::Connection) -> rusqlite::Result<ExitCode>,
+{
+    let con = match duh::db::open(db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: cannot open database: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match f(&con) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
         }
     }
 }

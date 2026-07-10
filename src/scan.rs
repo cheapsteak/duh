@@ -162,7 +162,7 @@ fn fmt_bytes(n: i64) -> String {
 /// longest existing prefix, re-appending any non-existent trailing components.
 /// Unlike `std::fs::canonicalize`, this does not fail on a missing leaf, so the
 /// caller can print the resolved path in the "path not found" error like Python.
-fn realpath(p: &Path) -> PathBuf {
+pub(crate) fn realpath(p: &Path) -> PathBuf {
     let abs = if p.is_absolute() {
         p.to_path_buf()
     } else {
