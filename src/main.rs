@@ -150,10 +150,34 @@ fn resolve_db_path(db_flag: Option<PathBuf>) -> PathBuf {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let _db_path = resolve_db_path(cli.db);
+    let db_path = resolve_db_path(cli.db);
 
     match cli.command {
         Command::Selftest => run_selftest(),
+        Command::Scan {
+            path,
+            quiet,
+            no_clones,
+            rescan,
+            cross_device,
+            min_free,
+            exclude,
+            include,
+            no_default_excludes,
+        } => duh::scan::run(
+            duh::scan::ScanArgs {
+                path,
+                quiet,
+                no_clones,
+                rescan,
+                cross_device,
+                min_free,
+                exclude,
+                include,
+                no_default_excludes,
+            },
+            &db_path,
+        ),
         // No other subcommand is implemented yet; later tasks will wire each up.
         other => {
             eprintln!("{}: not yet ported", other.name());
