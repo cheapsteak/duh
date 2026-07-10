@@ -2,9 +2,14 @@
 //!
 //! Two families of default excludes:
 //! - Single-name excludes match a directory entry's basename (`name`).
-//! - Multi-component excludes match by relative-path suffix (`rel_path`),
-//!   with a component-boundary check so e.g. `.git/objects` matches
-//!   `a/.git/objects` and `.git/objects` but not `notgit/objects`.
+//! - Multi-component excludes match by relative-path suffix (`rel_path`)
+//!   as a BARE string suffix test — there is no path-component-boundary
+//!   check. e.g. `.git/objects` matches `a/.git/objects` and `.git/objects`
+//!   but not `notgit/objects` — yet it DOES match `x.git/objects`, an
+//!   intentional false positive inherited from the Python oracle's
+//!   `is_excluded` (`./duh:246-255`). Do NOT "harden" this with boundary
+//!   logic: scan parity with the Python implementation depends on
+//!   replicating this quirk exactly.
 //!
 //! CLI wiring (see `duh:225-243`):
 //! - `--no-default-excludes` empties both default sets before anything else.
@@ -83,9 +88,11 @@ impl Excludes {
     ///
     /// Mirrors `is_excluded` (`duh:246-255`): `name` is checked against the
     /// single-name set (basename match), then `rel_path` is checked against
-    /// each multi-component pattern via suffix match (`ends_with` or exact
-    /// equality), which is what gives `.git/objects` a component-boundary
-    /// match against `a/.git/objects` without also matching `src/objects`.
+    /// each multi-component pattern via a bare string suffix match
+    /// (`ends_with` or exact equality). There is no component-boundary
+    /// check: `.git/objects` matches `a/.git/objects` but also `x.git/objects`
+    /// — a false positive the Python oracle exhibits too. Kept as-is on
+    /// purpose; scan parity requires replicating the quirk exactly.
     pub fn matches(&self, name: &str, rel_path: &str) -> bool {
         if self.single.contains(name) {
             return true;
@@ -142,16 +149,17 @@ mod tests {
         assert!(!ex.matches("objects", "repo/notgit/objects"));
     }
 
-    /// `.git/objects` also appears in `_SINGLE_NAME_EXCLUDES`'s complement
-    /// check implicitly: verify a name that is exactly the multi-component
-    /// pattern's final component ("objects") is NOT excluded by basename
-    /// alone when the rel_path doesn't carry the required prefix.
+    /// Pin the oracle's bare-suffix quirk: the multi-component check is a
+    /// raw `ends_with` with NO component-boundary guard, so a rel_path like
+    /// `x.git/objects` (directory literally named "x.git") DOES match the
+    /// `.git/objects` pattern. The Python oracle (`./duh:246-255`) behaves
+    /// identically. This false positive is intentional — if a future change
+    /// "fixes" it with boundary logic, this test must fail and force the
+    /// Python-parity conversation.
     #[test]
-    fn multi_component_pattern_does_not_leak_into_single_name_matching() {
+    fn bare_suffix_match_intentionally_hits_dotgit_lookalike_paths() {
         let ex = Excludes::from_args(&[], &[], false);
-        // "objects" alone is never in the single-name set, so a bare
-        // top-level "objects" dir is not excluded.
-        assert!(!ex.matches("objects", "objects"));
+        assert!(ex.matches("objects", "x.git/objects"));
     }
 
     /// `--no-default-excludes` clears the defaults, but an explicit
