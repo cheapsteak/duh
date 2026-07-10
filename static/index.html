@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>duh — disk explorer</title>
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<div id="error-banner"></div>
+<div id="header">
+  <div id="breadcrumb"></div>
+  <div id="mode-toggle">
+    <button class="mode-btn active" data-mode="freeable" onclick="setMode('freeable')">Freeable</button>
+    <button class="mode-btn" data-mode="blocks" onclick="setMode('blocks')">Allocated (du)</button>
+    <button class="mode-btn" data-mode="logical" onclick="setMode('logical')">Logical</button>
+  </div>
+  <div id="mode-legend" style="font-size:11px;color:#666;flex-shrink:0;max-width:380px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="Freeable = what rm -rf would actually return to df. Allocated double-counts APFS clones (e.g. git worktrees).">
+    Freeable = what rm -rf returns to df. Allocated double-counts APFS clones.
+  </div>
+</div>
+<div id="main">
+  <div id="list-pane">
+    <div id="loading"><span>Loading...</span></div>
+    <table id="files-table">
+      <thead>
+        <tr>
+          <th class="name">Name</th>
+          <th class="right">Size</th>
+          <th class="right">Files</th>
+          <th>Bar</th>
+        </tr>
+      </thead>
+      <tbody id="files-tbody"></tbody>
+    </table>
+  </div>
+  <div id="treemap-pane">
+    <div id="treemap"></div>
+  </div>
+</div>
+
+<script src="./vendor/echarts.min.js"></script>
+<script src="./app.js"></script>
+</body>
+</html>
