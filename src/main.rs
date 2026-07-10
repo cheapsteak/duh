@@ -92,6 +92,8 @@ enum Command {
     Excluded {
         #[arg(short = 'n', long, default_value_t = 50)]
         limit: i64,
+        #[arg(long)]
+        json: bool,
     },
 
     /// Report top delete-together groups by locked-at size
@@ -105,7 +107,11 @@ enum Command {
     },
 
     /// Show precomputed freeable bytes for a path
-    Freeable { path: String },
+    Freeable {
+        path: String,
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Open DB in sqlite3 with helpful views
     Sql,
@@ -178,12 +184,28 @@ fn main() -> ExitCode {
             },
             &db_path,
         ),
-        Command::Freeable { path } => run_with_db(&db_path, |con| duh::freeable::cmd_freeable(con, &path)),
+        Command::Freeable { path, json } => {
+            run_with_db(&db_path, |con| duh::freeable::cmd_freeable(con, &path, json))
+        }
         Command::Marginal { path, json } => {
             run_with_db(&db_path, |con| duh::freeable::cmd_marginal(con, &path, json))
         }
         Command::File { path } => run_with_db(&db_path, |con| duh::freeable::cmd_file(con, &path)),
-        // No other subcommand is implemented yet; later tasks will wire each up.
+        Command::Top { under, by, limit, depth, json } => run_with_db(&db_path, |con| {
+            duh::reports::cmd_top(con, under.as_deref(), &by, limit, depth, json)
+        }),
+        Command::Clones { under, min_bytes, limit, json } => run_with_db(&db_path, |con| {
+            duh::reports::cmd_clones(con, under.as_deref(), min_bytes, limit, json)
+        }),
+        Command::Excluded { limit, json } => {
+            run_with_db(&db_path, |con| duh::reports::cmd_excluded(con, limit, json))
+        }
+        Command::Clusters { min_bytes, limit, json } => run_with_db(&db_path, |con| {
+            duh::reports::cmd_clusters(con, min_bytes, limit, json)
+        }),
+        Command::Stats => run_with_db(&db_path, duh::reports::cmd_stats),
+        Command::Sql => duh::reports::cmd_sql(&db_path),
+        // Serve (Phase 4 / web UI) is not yet ported.
         other => {
             eprintln!("{}: not yet ported", other.name());
             ExitCode::from(2)

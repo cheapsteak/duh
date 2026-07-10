@@ -580,7 +580,7 @@ fn finalize_family<I: Iterator<Item = i64>>(
 // ---------------------------------------------------------------------------
 
 /// Walk path components top-down to find the node_id, or `None` if not indexed.
-fn resolve_path_to_id(con: &Connection, path: &Path) -> rusqlite::Result<Option<i64>> {
+pub(crate) fn resolve_path_to_id(con: &Connection, path: &Path) -> rusqlite::Result<Option<i64>> {
     let norm = path.as_os_str().as_bytes();
 
     // Fast path: exact root-level entry.
@@ -641,7 +641,7 @@ fn resolve_path_to_id(con: &Connection, path: &Path) -> rusqlite::Result<Option<
 }
 
 /// Reconstruct the full filesystem path from a node_id (port of `full_path`).
-fn full_path(con: &Connection, file_id: i64) -> rusqlite::Result<String> {
+pub(crate) fn full_path(con: &Connection, file_id: i64) -> rusqlite::Result<String> {
     let mut stmt = con.prepare(
         "WITH RECURSIVE chain(id, parent_id, name) AS ( \
            SELECT id, parent_id, name FROM files WHERE id = ? \
@@ -672,7 +672,7 @@ fn full_path(con: &Connection, file_id: i64) -> rusqlite::Result<String> {
 // ---------------------------------------------------------------------------
 
 /// IEC byte formatting with 1 decimal (port of `fmt_bytes`).
-fn fmt_bytes(n: i64) -> String {
+pub(crate) fn fmt_bytes(n: i64) -> String {
     if n < 0 {
         return format!("-{}", fmt_bytes(-n));
     }
@@ -685,7 +685,7 @@ fn fmt_bytes(n: i64) -> String {
 }
 
 /// Group an integer with commas, matching Python's `{:,}`.
-fn commafy(n: i64) -> String {
+pub(crate) fn commafy(n: i64) -> String {
     let neg = n < 0;
     let digits = n.unsigned_abs().to_string();
     let bytes = digits.as_bytes();
@@ -705,7 +705,7 @@ fn commafy(n: i64) -> String {
 
 /// Format an epoch second as `time.ctime` does (local time, trailing newline
 /// stripped) by delegating to the same libc the reference ultimately uses.
-fn ctime(secs: i64) -> String {
+pub(crate) fn ctime(secs: i64) -> String {
     unsafe {
         let t: libc::time_t = secs as libc::time_t;
         let mut tm: libc::tm = std::mem::zeroed();
@@ -727,7 +727,7 @@ fn ctime(secs: i64) -> String {
 // FREEABLE subcommand (`./duh:3076-3092`)
 // ---------------------------------------------------------------------------
 
-pub fn cmd_freeable(con: &Connection, path: &str) -> rusqlite::Result<ExitCode> {
+pub fn cmd_freeable(con: &Connection, path: &str, json: bool) -> rusqlite::Result<ExitCode> {
     let real = realpath(Path::new(path));
     let Some(node_id) = resolve_path_to_id(con, &real)? else {
         eprintln!(
@@ -740,6 +740,19 @@ pub fn cmd_freeable(con: &Connection, path: &str) -> rusqlite::Result<ExitCode> 
     let (freeable, locked_here) = compute(con)?;
     let f = freeable.get(&node_id).copied().unwrap_or(0);
     let lh = locked_here.get(&node_id).copied().unwrap_or(0);
+
+    if json {
+        // Rust-side addition (the reference `freeable` subcommand has no
+        // `--json`); keys mirror the text fields below.
+        let out = serde_json::json!({
+            "path": real.to_string_lossy(),
+            "freeable": f,
+            "locked_here": lh,
+        });
+        println!("{}", serde_json::to_string_pretty(&out).expect("serialize"));
+        return Ok(ExitCode::SUCCESS);
+    }
+
     println!("Path: {}", real.display());
     println!("  Freeable:    {}", fmt_bytes(f as i64));
     println!("  Locked here: {}", fmt_bytes(lh as i64));
@@ -759,7 +772,7 @@ struct MarginalResult {
     dir_count: i64,
 }
 
-const DESC_CTE: &str = "WITH RECURSIVE desc_ids(id) AS ( \
+pub(crate) const DESC_CTE: &str = "WITH RECURSIVE desc_ids(id) AS ( \
     SELECT id FROM files WHERE id = ?1 \
     UNION ALL \
     SELECT f.id FROM files f JOIN desc_ids d ON f.parent_id = d.id ) ";
