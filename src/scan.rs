@@ -99,6 +99,23 @@ fn free_gib(path: &Path) -> f64 {
     (s.f_bavail as f64 * s.f_frsize as f64) / (1024f64 * 1024.0 * 1024.0)
 }
 
+/// Python `{n:,}` equivalent: thousands separators for the file counts in the
+/// stderr progress / interrupt / completion lines (`./duh:780,822,829` — only
+/// the file counts get separators there; excluded counts do not).
+fn fmt_thousands(n: i64) -> String {
+    let (sign, mut digits) = if n < 0 {
+        ("-", n.unsigned_abs().to_string())
+    } else {
+        ("", n.to_string())
+    };
+    let mut i = digits.len();
+    while i > 3 {
+        i -= 3;
+        digits.insert(i, ',');
+    }
+    format!("{sign}{digits}")
+}
+
 /// IEC byte formatting, ported from `fmt_bytes` (`./duh:175-181`). Used only for
 /// stderr progress / completion lines.
 fn fmt_bytes(n: i64) -> String {
@@ -521,13 +538,18 @@ fn run_inner(
             }
 
             // clone_id for every non-symlink entry (files AND dirs) unless
-            // --no-clones (./duh:726-731). We call get_clone_id per entry rather
-            // than reusing EntryAttrs.clone_id because the latter is None for
-            // directories, whereas the reference records a dir's own clone id.
+            // --no-clones (./duh:726-731). For regular files, reuse the clone id
+            // already extracted by read_dir_attrs (same ATTR_CMNEXT_CLONEID flags
+            // and zero→None logic — verified byte-identical to per-path
+            // get_clone_id in the parity diff). Only directories need the extra
+            // syscall: the bulk reader gates clone_id to VREG, but the reference
+            // records a dir's own clone id too.
             let clone_id = if args.no_clones || is_symlink {
                 None
-            } else {
+            } else if is_dir {
                 attrs::get_clone_id(&entry_path)
+            } else {
+                entry.clone_id
             };
 
             if is_dir && !is_symlink {
@@ -578,7 +600,7 @@ fn run_inner(
                 let rate = if elapsed > 0.0 { total_files as f64 / elapsed } else { 0.0 };
                 eprintln!(
                     "[{} files, {} excluded, {} scanned, {:.0} files/sec]",
-                    total_files,
+                    fmt_thousands(total_files),
                     total_excluded,
                     fmt_bytes(total_blocks),
                     rate
@@ -626,7 +648,10 @@ fn run_inner(
     }
 
     if INTERRUPTED.load(Ordering::SeqCst) {
-        eprintln!("\n[interrupted] partial scan committed: {total_files} files");
+        eprintln!(
+            "\n[interrupted] partial scan committed: {} files",
+            fmt_thousands(total_files)
+        );
         return Ok(ExitCode::from(130));
     }
 
@@ -637,7 +662,7 @@ fn run_inner(
             "Scan complete: {} files, {} excluded dirs in {:.1}s ({:.0} files/sec)\n\
              \x20 logical: {}  blocks: {}\n\
              \x20 DB: {}",
-            total_files,
+            fmt_thousands(total_files),
             total_excluded,
             elapsed,
             rate,
@@ -648,4 +673,20 @@ fn run_inner(
     }
 
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fmt_thousands;
+
+    /// Pin parity with Python's `{n:,}` formatting (used at ./duh:780,822,829).
+    #[test]
+    fn fmt_thousands_matches_python_comma_format() {
+        assert_eq!(fmt_thousands(0), "0");
+        assert_eq!(fmt_thousands(999), "999");
+        assert_eq!(fmt_thousands(1000), "1,000");
+        assert_eq!(fmt_thousands(123456), "123,456");
+        assert_eq!(fmt_thousands(1234567), "1,234,567");
+        assert_eq!(fmt_thousands(-1234567), "-1,234,567");
+    }
 }
