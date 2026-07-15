@@ -88,6 +88,16 @@ thead th {
   white-space: nowrap;
 }
 thead th.right { text-align: right; }
+tfoot td {
+  position: sticky;
+  bottom: 0;
+  background: #222;
+  padding: 6px 10px;
+  color: #ccc;
+  border-top: 1px solid #333;
+  white-space: nowrap;
+}
+tfoot td.size, tfoot td.files { font-weight: bold; }
 tbody tr {
   border-bottom: 1px solid #2a2a2a;
 }

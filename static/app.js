@@ -193,6 +193,44 @@ function renderTable() {
 
     tbody.appendChild(tr);
   });
+
+  // Total row
+  const tfoot = document.getElementById('files-tfoot');
+  tfoot.innerHTML = '';
+  if (children.length > 0) {
+    const totalSize = children.reduce((s, c) => s + sizeField(c), 0);
+    const totalFiles = children.reduce((s, c) => s + (c.total_files || 0), 0);
+
+    const tr = document.createElement('tr');
+
+    const tdName = document.createElement('td');
+    tdName.className = 'name';
+    tdName.textContent = `Total (${children.length} items)`;
+    tr.appendChild(tdName);
+
+    const tdSize = document.createElement('td');
+    tdSize.className = 'size';
+    tdSize.textContent = fmtBytes(totalSize);
+    if (state.mode === 'freeable' && state.nodeInfo) {
+      const own = state.nodeInfo.freeable || 0;
+      if (own > totalSize * 1.05) {
+        tdSize.title = 'Rows sum to ' + fmtBytes(totalSize) +
+          ', but deleting this whole directory frees ' + fmtBytes(own) +
+          ' — the difference is space shared across children (freed only together).';
+        tdSize.textContent = fmtBytes(totalSize) + ' †';
+      }
+    }
+    tr.appendChild(tdSize);
+
+    const tdFiles = document.createElement('td');
+    tdFiles.className = 'files';
+    tdFiles.textContent = fmtCount(totalFiles);
+    tr.appendChild(tdFiles);
+
+    tr.appendChild(document.createElement('td')); // empty bar cell
+
+    tfoot.appendChild(tr);
+  }
 }
 
 function renderTreemap() {
