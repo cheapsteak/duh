@@ -291,13 +291,17 @@ function renderTreemap(animate) {
     };
   });
 
-  chart.setOption({
+  // Navigation swaps in an unrelated node set — tweening between the two reads
+  // as a nonsensical shuffle, so navigation renders instantly. Mode toggles
+  // keep the morph: the same tiles meaningfully resize.
+  // NOTE: instant means notMerge + animation:false (a from-scratch render,
+  // same code path as initial load). A merged update with duration 0 hits an
+  // ECharts treemap bug where the layout tween never fires and nothing paints.
+  const option = {
     backgroundColor: '#1a1a1a',
+    animation: !!animate,
     series: [{
       type: 'treemap',
-      // Navigation swaps in an unrelated node set — tweening between the two
-      // reads as a nonsensical shuffle, so navigation renders instantly.
-      // Mode toggles keep the morph: the same tiles meaningfully resize.
       animationDurationUpdate: animate ? 400 : 0,
       roam: false,
       nodeClick: false,
@@ -326,7 +330,8 @@ function renderTreemap(animate) {
       },
       data: data,
     }]
-  });
+  };
+  chart.setOption(option, { notMerge: !animate });
 }
 
 // ---- mode toggle ----
