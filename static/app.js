@@ -104,6 +104,9 @@ function render(opts) {
 
 function renderBreadcrumb() {
   const el = document.getElementById('breadcrumb');
+  // The copy button is a persistent node (it carries the click listener);
+  // detach it before clearing and re-append after the last crumb.
+  const copyBtn = document.getElementById('copy-path');
   el.innerHTML = '';
   state.breadcrumb.forEach((crumb, i) => {
     if (i > 0) {
@@ -122,6 +125,7 @@ function renderBreadcrumb() {
     }
     el.appendChild(span);
   });
+  if (copyBtn) el.appendChild(copyBtn);
 }
 
 function sizeField(child) {
