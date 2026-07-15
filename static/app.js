@@ -80,10 +80,10 @@ window.addEventListener('popstate', (e) => {
 });
 
 // ---- rendering ----
-function render() {
+function render(opts) {
   renderBreadcrumb();
   renderTable();
-  renderTreemap();
+  renderTreemap(opts && opts.animate);
 }
 
 function renderBreadcrumb() {
@@ -241,7 +241,7 @@ const PALETTE = ['#3987e5', '#199e70', '#c98500', '#008300', '#9085e9', '#e66767
 const INK     = ['#111111', '#111111', '#111111', '#ffffff', '#111111', '#111111', '#111111', '#111111'];
 const EXCL_FILL = '#c8a000', EXCL_INK = '#111111';
 
-function renderTreemap() {
+function renderTreemap(animate) {
   if (!chart) return;
   const children = state.children;
   // Sort by value so palette index matches layout adjacency (treemap lays out desc).
@@ -268,6 +268,10 @@ function renderTreemap() {
     backgroundColor: '#1a1a1a',
     series: [{
       type: 'treemap',
+      // Navigation swaps in an unrelated node set — tweening between the two
+      // reads as a nonsensical shuffle, so navigation renders instantly.
+      // Mode toggles keep the morph: the same tiles meaningfully resize.
+      animationDurationUpdate: animate ? 400 : 0,
       roam: false,
       nodeClick: false,
       breadcrumb: { show: false },
@@ -304,7 +308,7 @@ function setMode(mode) {
   document.querySelectorAll('.mode-btn').forEach(b => {
     b.classList.toggle('active', b.dataset.mode === mode);
   });
-  render();
+  render({ animate: true });
 }
 
 // ---- helpers ----
