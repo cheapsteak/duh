@@ -6,3 +6,5 @@ __pycache__/
 *.sparseimage
 blackbox/__pycache__/
 /target
+docs/superpowers/plans/*.md
+!docs/superpowers/plans/CLAUDE.md
