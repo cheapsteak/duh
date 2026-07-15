@@ -233,15 +233,36 @@ function renderTable() {
   }
 }
 
+// Categorical palette validated for the dark surface (#1a1a1a): lightness band,
+// chroma floor, adjacent-pair CVD separation, >=3:1 vs surface all pass.
+// INK[i] is the WCAG-preferred text color on PALETTE[i] (all pairs >=4.8:1) —
+// computed, not eyeballed. Excluded dirs use the amber EXCL pair.
+const PALETTE = ['#3987e5', '#199e70', '#c98500', '#008300', '#9085e9', '#e66767', '#d55181', '#d95926'];
+const INK     = ['#111111', '#111111', '#111111', '#ffffff', '#111111', '#111111', '#111111', '#111111'];
+const EXCL_FILL = '#c8a000', EXCL_INK = '#111111';
+
 function renderTreemap() {
   if (!chart) return;
   const children = state.children;
-  const data = children.map(c => ({
-    name: c.name,
-    value: sizeField(c) || 0,
-    id: c.id,
-    itemStyle: c.is_excluded ? { color: '#c8a000', opacity: 0.9 } : undefined,
-  })).filter(d => d.value > 0);
+  // Sort by value so palette index matches layout adjacency (treemap lays out desc).
+  const sorted = children
+    .map(c => ({ c, value: sizeField(c) || 0 }))
+    .filter(d => d.value > 0)
+    .sort((a, b) => b.value - a.value);
+  const total = sorted.reduce((s, d) => s + d.value, 0);
+
+  const data = sorted.map((d, i) => {
+    const fill = d.c.is_excluded ? EXCL_FILL : PALETTE[i % PALETTE.length];
+    const ink = d.c.is_excluded ? EXCL_INK : INK[i % INK.length];
+    return {
+      name: d.c.name,
+      value: d.value,
+      id: d.c.id,
+      itemStyle: { color: fill, opacity: d.c.is_excluded ? 0.9 : 1 },
+      label: { color: ink },
+      emphasis: { label: { color: ink, fontWeight: 'bold' } },
+    };
+  });
 
   chart.setOption({
     backgroundColor: '#1a1a1a',
@@ -254,19 +275,23 @@ function renderTreemap() {
       height: '100%',
       label: {
         show: true,
-        formatter: (p) => p.data.name + '\n' + fmtBytes(p.data.value),
-        color: '#e0e0e0',
-        fontSize: 11,
+        // Slivers (<1% of view) render only truncated garbage — show nothing;
+        // the hover tooltip and the table still carry them.
+        formatter: (p) => (p.data.value / total < 0.01)
+          ? ''
+          : p.data.name + '\n' + fmtBytes(p.data.value),
+        fontSize: 12,
+        fontWeight: 500,
+        lineHeight: 16,
         overflow: 'truncate',
       },
       upperLabel: { show: false },
       itemStyle: {
         gapWidth: 2,
         borderColor: '#1a1a1a',
-        color: '#3a5a8a',
       },
       emphasis: {
-        itemStyle: { borderColor: '#7eb8f7', borderWidth: 2 }
+        itemStyle: { borderColor: '#ffffff', borderWidth: 2 }
       },
       data: data,
     }]
