@@ -345,9 +345,13 @@ fn api_node(con: &Connection, state: &State, node_id: i64) -> ApiResult {
         total_logical: i64,
         total_files: i64,
         freeable: u64,
+        clone_id: Option<i64>,
+        nlinks: i64,
+        shared: bool,
     }
     let mut stmt = con.prepare(
-        "SELECT id, name, is_dir, is_excluded, size_blocks, size_logical, excluded_file_count \
+        "SELECT id, name, is_dir, is_excluded, size_blocks, size_logical, excluded_file_count, \
+                clone_id, nlinks \
          FROM files WHERE parent_id = ?",
     )?;
     let rows = stmt.query_map([node_id], |r| {
@@ -359,12 +363,15 @@ fn api_node(con: &Connection, state: &State, node_id: i64) -> ApiResult {
             r.get::<_, i64>(4)?,           // size_blocks
             r.get::<_, i64>(5)?,           // size_logical
             r.get::<_, Option<i64>>(6)?,   // excluded_file_count
+            r.get::<_, Option<i64>>(7)?,   // clone_id
+            r.get::<_, i64>(8)?,           // nlinks
         ))
     })?;
 
     let mut children: Vec<Child> = Vec::new();
     for row in rows {
-        let (cid, cname, c_is_dir, c_is_excluded, size_blocks, size_logical, excl_count) = row?;
+        let (cid, cname, c_is_dir, c_is_excluded, size_blocks, size_logical, excl_count, clone_id, nlinks) =
+            row?;
         let (total_blocks, total_logical, total_files) = if c_is_dir != 0 && c_is_excluded == 0 {
             let cagg = state.dir_agg.get(&cid).copied().unwrap_or_default();
             (cagg.total_blocks, cagg.total_logical, cagg.total_files)
@@ -372,6 +379,17 @@ fn api_node(con: &Connection, state: &State, node_id: i64) -> ApiResult {
             (size_blocks, size_logical, excl_count.unwrap_or(0))
         } else {
             (size_blocks, size_logical, 1)
+        };
+        // Dirs get their computed freeable. Files get a PROVISIONAL freeable of
+        // size_blocks (the compute engine only produces per-directory values;
+        // a file's blocks are credited to its parent's bucket). The exact value
+        // (0 when the blocks are also held by a clone twin or hardlink) is
+        // resolved below, but only for the rows that survive the 200-cap, so a
+        // 100k-file directory doesn't pay 100k clone-family lookups per click.
+        let freeable = if c_is_dir != 0 {
+            state.freeable_map.get(&cid).copied().unwrap_or(0)
+        } else {
+            size_blocks.max(0) as u64
         };
         children.push(Child {
             id: cid,
@@ -381,14 +399,43 @@ fn api_node(con: &Connection, state: &State, node_id: i64) -> ApiResult {
             total_blocks,
             total_logical,
             total_files,
-            freeable: state.freeable_map.get(&cid).copied().unwrap_or(0),
+            freeable,
+            clone_id,
+            nlinks,
+            shared: false,
         });
     }
 
     // Stable sort by freeable desc, limit 200 (`reference/duh-py:2926-2927`). Stability
-    // keeps the DB order for ties, matching Python's stable sort.
+    // keeps the DB order for ties, matching Python's stable sort. Deliberate deviation
+    // from the reference: file rows sort by their provisional (unshared) size, so a
+    // large clone-shared file stays visible near the top wearing a "shared" tag
+    // instead of sinking below every tiny unique file as a bare 0.
     children.sort_by(|a, b| b.freeable.cmp(&a.freeable));
     children.truncate(200);
+
+    // Resolve exact file freeable for the survivors: blocks also reachable via
+    // another path (hardlink, clone twin among files, or a twin inside an
+    // excluded aggregate) mean deleting this one path frees nothing.
+    {
+        let mut shared_stmt = con.prepare(
+            "SELECT EXISTS(SELECT 1 FROM files WHERE clone_id = ?1 AND id != ?2) \
+                 OR EXISTS(SELECT 1 FROM excluded_families WHERE clone_id = ?1)",
+        )?;
+        for c in children.iter_mut() {
+            if c.is_dir != 0 {
+                continue;
+            }
+            let clone_shared = match c.clone_id {
+                Some(cl) => shared_stmt.query_row((cl, c.id), |r| r.get::<_, i64>(0))? != 0,
+                None => false,
+            };
+            if c.nlinks > 1 || clone_shared {
+                c.shared = true;
+                c.freeable = 0;
+            }
+        }
+    }
 
     let children_json: Vec<Value> = children
         .iter()
@@ -403,6 +450,7 @@ fn api_node(con: &Connection, state: &State, node_id: i64) -> ApiResult {
                 "total_files": c.total_files,
                 "freeable": c.freeable,
                 "locked_here": state.locked_here_map.get(&c.id).copied().unwrap_or(0),
+                "shared": if c.shared { 1 } else { 0 },
             })
         })
         .collect();

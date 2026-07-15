@@ -166,3 +166,26 @@ td.marginal { text-align: right; color: #ffcc66; min-width: 90px; }
   border-bottom: 1px solid #800000;
   display: none;
 }
+.tag-shared {
+  display: inline-block;
+  background: #1a3a5a;
+  color: #7eb8f7;
+  border: 1px solid #2a5a8a;
+  border-radius: 3px;
+  padding: 0 5px;
+  font-size: 10px;
+  margin-left: 5px;
+}
+#copy-path {
+  background: none;
+  border: 1px solid #444;
+  color: #aaa;
+  padding: 3px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+  font-family: inherit;
+  flex-shrink: 0;
+}
+#copy-path:hover { border-color: #7eb8f7; color: #7eb8f7; }
+#copy-path.copied { border-color: #4caf50; color: #4caf50; }

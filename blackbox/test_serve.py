@@ -99,6 +99,30 @@ def test_missing_host_rejected(server):
 
 
 @rust_only
+def test_file_children_freeable_semantics(server):
+    """File rows carry real freeable values (rust improvement over the oracle,
+    which reported 0 for every file): a unique file's freeable is its allocated
+    size; a clone with a twin elsewhere is 0 and tagged shared."""
+    root = json.load(_get(f"{server}/api/root"))
+
+    def child(node_id, name):
+        resp = json.load(_get(f"{server}/api/node/{node_id}"))
+        return next(c for c in resp["children"] if c["name"] == name)
+
+    unique_dir = child(root["id"], "unique")
+    u_bin = child(unique_dir["id"], "u.bin")
+    assert u_bin["shared"] == 0
+    assert u_bin["freeable"] == u_bin["total_blocks"] > 0
+
+    siblings = child(root["id"], "siblings")
+    x_dir = child(siblings["id"], "x")
+    data_bin = child(x_dir["id"], "data.bin")  # clone twin lives in siblings/y
+    assert data_bin["shared"] == 1
+    assert data_bin["freeable"] == 0
+    assert data_bin["total_blocks"] > 0
+
+
+@rust_only
 def test_static_asset_content_types(server):
     expected = {
         "/style.css": "text/css",

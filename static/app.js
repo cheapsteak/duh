@@ -19,6 +19,22 @@ window.addEventListener('DOMContentLoaded', async () => {
   });
   window.addEventListener('resize', () => chart && chart.resize());
 
+  const copyBtn = document.getElementById('copy-path');
+  copyBtn.addEventListener('click', async () => {
+    if (!state.nodeInfo) return;
+    try {
+      await navigator.clipboard.writeText(state.nodeInfo.path);
+      copyBtn.textContent = '✓';
+      copyBtn.classList.add('copied');
+      setTimeout(() => {
+        copyBtn.textContent = '⧉';
+        copyBtn.classList.remove('copied');
+      }, 1200);
+    } catch (e) {
+      showError('Copy failed: ' + e.message);
+    }
+  });
+
   // Check URL for deep-link
   const params = new URLSearchParams(window.location.search);
   const startId = params.get('id') ? parseInt(params.get('id')) : null;
@@ -165,6 +181,13 @@ function renderTable() {
       const tag = document.createElement('span');
       tag.className = 'tag-excl';
       tag.textContent = 'excl';
+      tdName.appendChild(tag);
+    }
+    if (child.shared) {
+      const tag = document.createElement('span');
+      tag.className = 'tag-shared';
+      tag.textContent = 'shared';
+      tag.title = 'Clone or hardlink: these blocks are also referenced from another path — deleting this alone frees 0 B (size: ' + fmtBytes(child.total_blocks) + ')';
       tdName.appendChild(tag);
     }
     tr.appendChild(tdName);
