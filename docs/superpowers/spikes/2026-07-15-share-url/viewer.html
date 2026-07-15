@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>duh share — codec spike</title>
+<style>
+body { background:#1a1a1a; color:#e0e0e0; font-family:'SF Mono',monospace; font-size:13px; padding:20px; }
+#status { padding:10px 14px; border-radius:6px; margin-bottom:16px; font-weight:bold; }
+.pass { background:#0a3a0a; color:#7fdc7f; border:1px solid #1a6a1a; }
+.fail { background:#4a0000; color:#ff8888; border:1px solid #800000; }
+#stats { color:#888; margin-bottom:16px; line-height:1.7; }
+details { margin-left:18px; }
+summary { cursor:pointer; padding:1px 0; }
+summary .sz { color:#b0d0ff; }
+summary .other { color:#777; font-style:italic; }
+.leaf { margin-left:18px; color:#aaa; padding:1px 0; }
+</style>
+</head>
+<body>
+<div id="status">decoding…</div>
+<div id="stats"></div>
+<div id="tree"></div>
+<script>
+const fmtBytes = n => {
+  const G=2**30, M=2**20, K=2**10;
+  if (n>=G) return (n/G).toFixed(1)+' GiB';
+  if (n>=M) return (n/M).toFixed(1)+' MiB';
+  if (n>=K) return (n/K).toFixed(1)+' KiB';
+  return n+' B';
+};
+
+function b64urlToBytes(s) {
+  s = s.replace(/-/g,'+').replace(/_/g,'/');
+  while (s.length % 4) s += '=';
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i=0;i<bin.length;i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+async function inflate(bytes) {
+  const ds = new DecompressionStream('deflate');   // zlib-wrapped, matches python zlib / rust flate2
+  const stream = new Blob([bytes]).stream().pipeThrough(ds);
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+// invariant: visible children + *other must sum to parent within quantization slop
+function checkSums(node, errs, path) {
+  const [name, size, kids] = node;
+  if (!kids) return 1;
+  let sum = 0, cnt = 1;
+  for (const k of kids) { sum += k[1]; if (k[0] !== '*') cnt += checkSums(k, errs, path+'/'+k[0]); }
+  const slop = Math.max(size * 0.02, 2048);   // quantization + rounding accumulation
+  if (Math.abs(sum - size) > slop) errs.push(`${path||name}: children sum ${sum} vs ${size}`);
+  return cnt;
+}
+
+function renderNode(node) {
+  const [name, size, kids] = node;
+  if (name === '*') {
+    const d = document.createElement('div');
+    d.className = 'leaf';
+    d.innerHTML = `<span class="other">… other — <span class="sz">${fmtBytes(size)}</span></span>`;
+    return d;
+  }
+  if (!kids) {
+    const d = document.createElement('div');
+    d.className = 'leaf';
+    d.textContent = `${name} — `;
+    const s = document.createElement('span'); s.className='sz'; s.textContent = fmtBytes(size);
+    d.appendChild(s);
+    return d;
+  }
+  const det = document.createElement('details');
+  const sum = document.createElement('summary');
+  sum.innerHTML = `${name} — <span class="sz">${fmtBytes(size)}</span>`;
+  det.appendChild(sum);
+  for (const k of kids) det.appendChild(renderNode(k));
+  return det;
+}
+
+(async () => {
+  const status = document.getElementById('status');
+  try {
+    const frag = location.hash.slice(1);
+    if (!frag) throw new Error('no fragment');
+    const [ver, data] = [frag.slice(0, frag.indexOf('.')), frag.slice(frag.indexOf('.')+1)];
+    if (ver !== '1') throw new Error('unknown format version: ' + ver);
+    const t0 = performance.now();
+    const raw = await inflate(b64urlToBytes(data));
+    const doc = JSON.parse(new TextDecoder().decode(raw));
+    const ms = (performance.now() - t0).toFixed(1);
+    const errs = [];
+    const nodeCount = checkSums(doc.n, errs, '');
+    if (errs.length) throw new Error('sum invariant failed:\n' + errs.slice(0,5).join('\n'));
+    status.textContent = `PASS — decoded ${nodeCount} nodes in ${ms}ms, sum invariants hold`;
+    status.className = 'pass';
+    document.getElementById('stats').innerHTML =
+      `root: <b>${doc.t}</b> · scanned ${doc.d} · total freeable <b>${fmtBytes(doc.tot)}</b> · ` +
+      `fragment ${frag.length.toLocaleString()} chars → ${raw.length.toLocaleString()} bytes JSON`;
+    const tree = renderNode(doc.n);
+    if (tree.tagName === 'DETAILS') tree.open = true;
+    document.getElementById('tree').appendChild(tree);
+    document.title = 'PASS — duh share spike';
+  } catch (e) {
+    status.textContent = 'FAIL — ' + e.message;
+    status.className = 'fail';
+    document.title = 'FAIL — duh share spike';
+  }
+})();
+</script>
+</body>
+</html>
