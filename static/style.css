@@ -190,3 +190,10 @@ td.marginal { text-align: right; color: #ffcc66; min-width: 90px; }
 }
 #copy-path:hover { color: #7eb8f7; background: rgba(126,184,247,0.08); }
 #copy-path.copied { color: #4caf50; }
+#disk-free {
+  color: #888;
+  font-size: 12px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  margin-right: 10px;
+}

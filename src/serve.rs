@@ -49,6 +49,21 @@ struct State {
     locked_here_map: HashMap<i64, u64>,
     /// Memoized id -> full path (port of `_PathCache`, `reference/duh-py:2242-2267`).
     path_cache: Mutex<HashMap<i64, String>>,
+    /// Latest scan root — statvfs'd per request so the header's free-space
+    /// readout tracks deletions live without a rescan.
+    scan_root: Option<PathBuf>,
+}
+
+/// (free, total) bytes on the volume containing `path`, or None on failure.
+fn disk_free_total(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
+        return None;
+    }
+    let frsize = s.f_frsize as u64;
+    Some((s.f_bavail as u64 * frsize, s.f_blocks as u64 * frsize))
 }
 
 /// Entry point for `duh serve`.
@@ -79,6 +94,12 @@ pub fn run(db_path: &Path, port: u16, no_browser: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let scan_root: Option<PathBuf> = con
+        .query_row("SELECT root FROM scans ORDER BY id DESC LIMIT 1", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .ok()
+        .map(PathBuf::from);
     drop(con);
 
     let state = Arc::new(State {
@@ -87,6 +108,7 @@ pub fn run(db_path: &Path, port: u16, no_browser: bool) -> ExitCode {
         freeable_map,
         locked_here_map,
         path_cache: Mutex::new(HashMap::new()),
+        scan_root,
     });
 
     // Bind, trying up to port+10 (port range fallback, `reference/duh-py:2988-2997`).
@@ -320,6 +342,7 @@ fn api_node(con: &Connection, state: &State, node_id: i64) -> ApiResult {
 
     let agg = state.dir_agg.get(&node_id).copied().unwrap_or_default();
     let node_path = path_for(con, state, node_id)?;
+    let disk = state.scan_root.as_deref().and_then(disk_free_total);
 
     let node_info = json!({
         "id": node_id,
@@ -333,6 +356,8 @@ fn api_node(con: &Connection, state: &State, node_id: i64) -> ApiResult {
         "parent_id": parent_id,
         "freeable": state.freeable_map.get(&node_id).copied().unwrap_or(0),
         "locked_here": state.locked_here_map.get(&node_id).copied().unwrap_or(0),
+        "disk_free": disk.map(|d| d.0),
+        "disk_total": disk.map(|d| d.1),
     });
 
     // Immediate children, in the DB's natural (parent-index) order.

@@ -98,8 +98,19 @@ window.addEventListener('popstate', (e) => {
 // ---- rendering ----
 function render() {
   renderBreadcrumb();
+  renderDiskFree();
   renderTable();
   renderTreemap();
+}
+
+function renderDiskFree() {
+  const el = document.getElementById('disk-free');
+  const n = state.nodeInfo;
+  if (n && n.disk_free != null && n.disk_total != null) {
+    el.textContent = fmtBytes(n.disk_free) + ' free of ' + fmtBytes(n.disk_total);
+  } else {
+    el.textContent = '';
+  }
 }
 
 function renderBreadcrumb() {
