@@ -96,10 +96,10 @@ window.addEventListener('popstate', (e) => {
 });
 
 // ---- rendering ----
-function render(opts) {
+function render() {
   renderBreadcrumb();
   renderTable();
-  renderTreemap(opts && opts.animate);
+  renderTreemap();
 }
 
 function renderBreadcrumb() {
@@ -268,7 +268,7 @@ const PALETTE = ['#3987e5', '#199e70', '#c98500', '#008300', '#9085e9', '#e66767
 const INK     = ['#111111', '#111111', '#111111', '#ffffff', '#111111', '#111111', '#111111', '#111111'];
 const EXCL_FILL = '#c8a000', EXCL_INK = '#111111';
 
-function renderTreemap(animate) {
+function renderTreemap() {
   if (!chart) return;
   const children = state.children;
   // Sort by value so palette index matches layout adjacency (treemap lays out desc).
@@ -291,18 +291,10 @@ function renderTreemap(animate) {
     };
   });
 
-  // Navigation swaps in an unrelated node set — tweening between the two reads
-  // as a nonsensical shuffle, so navigation renders instantly. Mode toggles
-  // keep the morph: the same tiles meaningfully resize.
-  // NOTE: instant means notMerge + animation:false (a from-scratch render,
-  // same code path as initial load). A merged update with duration 0 hits an
-  // ECharts treemap bug where the layout tween never fires and nothing paints.
-  const option = {
+  chart.setOption({
     backgroundColor: '#1a1a1a',
-    animation: !!animate,
     series: [{
       type: 'treemap',
-      animationDurationUpdate: animate ? 400 : 0,
       roam: false,
       nodeClick: false,
       breadcrumb: { show: false },
@@ -330,8 +322,7 @@ function renderTreemap(animate) {
       },
       data: data,
     }]
-  };
-  chart.setOption(option, { notMerge: !animate });
+  });
 }
 
 // ---- mode toggle ----
@@ -340,7 +331,7 @@ function setMode(mode) {
   document.querySelectorAll('.mode-btn').forEach(b => {
     b.classList.toggle('active', b.dataset.mode === mode);
   });
-  render({ animate: true });
+  render();
 }
 
 // ---- helpers ----
