@@ -62,7 +62,7 @@ fn disk_free_total(path: &Path) -> Option<(u64, u64)> {
     if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
         return None;
     }
-    let frsize = s.f_frsize as u64;
+    let frsize = s.f_frsize;
     Some((s.f_bavail as u64 * frsize, s.f_blocks as u64 * frsize))
 }
 
