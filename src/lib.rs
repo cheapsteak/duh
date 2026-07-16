@@ -5,3 +5,4 @@ pub mod freeable;
 pub mod reports;
 pub mod scan;
 pub mod serve;
+pub mod share;
