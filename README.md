@@ -48,6 +48,24 @@ opens http://127.0.0.1:7777/ — a zoomable treemap with three size modes:
 Clone families that span siblings show up as "shared across N children"
 rather than being silently attributed to one of them.
 
+## Sharing
+
+The **Share** button in the treemap header turns the current snapshot into a
+link you can hand to someone else. It offers three tiers by how much of the
+tree to include:
+
+- **Compact** — the top few levels; short enough to paste into Discord or a chat box.
+- **Standard** — a deeper cut that still fits in a Slack message or Reddit comment.
+- **Deep** — the biggest slice, for sending browser-to-browser where long URLs are fine.
+
+The picked subtree is deflate-compressed and packed into the URL **fragment**
+(everything after `#`), then opened on the static viewer at
+<https://cheapsteak.github.io/duh/v/>. Because it lives in the fragment, the
+snapshot never leaves the browser — it is not sent to any server, not the
+viewer's host and not us. Privacy model in one line: your directory names go
+into the link, so anyone you give the link to can read them — share it as
+deliberately as you would a screenshot.
+
 ## Quickstart
 
 Install the binary onto your `PATH` (`duh`), then:
