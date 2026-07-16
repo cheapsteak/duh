@@ -12,11 +12,11 @@
 //! `include_bytes!`-embedded so the release binary is self-contained, and every
 //! request is screened by a Host-header guard (DNS-rebinding protection).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use rusqlite::{Connection, OpenFlags};
@@ -24,6 +24,11 @@ use serde_json::{json, Value};
 use tiny_http::{Header, Response, Server};
 
 use crate::freeable;
+use crate::share;
+
+/// Default base URL for share fragments, overridable via `DUH_SHARE_BASE`
+/// (e.g. for local development against a different viewer deployment).
+const DEFAULT_SHARE_BASE: &str = "https://cheapsteak.github.io/duh/v/";
 
 // --- embedded static assets (Rust-only; the oracle serves inline HTML) --------
 static INDEX_HTML: &[u8] = include_bytes!("../static/index.html");
@@ -52,6 +57,10 @@ struct State {
     /// Latest scan root — statvfs'd per request so the header's free-space
     /// readout tracks deletions live without a rescan.
     scan_root: Option<PathBuf>,
+    /// Clone-family qualification set for the share encoder (`share::multi_clone_set`),
+    /// built lazily on the first `/api/share` request since it costs a full
+    /// `files`/`excluded_families` scan that most `serve` sessions never need.
+    multi_clone: OnceLock<HashSet<i64>>,
 }
 
 /// (free, total) bytes on the volume containing `path`, or None on failure.
@@ -109,6 +118,7 @@ pub fn run(db_path: &Path, port: u16, no_browser: bool) -> ExitCode {
         locked_here_map,
         path_cache: Mutex::new(HashMap::new()),
         scan_root,
+        multi_clone: OnceLock::new(),
     });
 
     // Bind, trying up to port+10 (port range fallback, `reference/duh-py:2988-2997`).
@@ -264,6 +274,10 @@ fn route(
         }
         _ if path.starts_with("/api/breadcrumb/") => {
             dispatch_id(&path["/api/breadcrumb/".len()..], |id| api_breadcrumb(con, id))
+        }
+        _ if path.starts_with("/api/share/") => {
+            let query = raw_url.split_once('?').map(|(_, q)| q).unwrap_or("");
+            dispatch_id(&path["/api/share/".len()..], |id| api_share(con, state, id, query))
         }
         _ => json_response(&json!({"error": "not found"}), 404),
     }
@@ -519,6 +533,104 @@ fn api_breadcrumb(con: &Connection, node_id: i64) -> ApiResult {
     Ok(Ok(Value::Array(crumbs)))
 }
 
+/// `GET /api/share/{id}?budget=N` — a shareable URL fragment for the subtree
+/// rooted at `id`, sized to fit `budget` characters (default 8000, clamped to
+/// `100..=100000`).
+///
+/// Node existence is checked up front (same query pattern as [`api_node`]) so
+/// unknown ids map to 404. [`share::build_share`] also returns `None` for a
+/// budget too small to fit even the bare root — since the node is known to
+/// exist at that point, that case maps to 400 with the same budget message
+/// (in practice unreachable above the validated 100-char floor, since the
+/// bare-root fragment is far smaller, but the mapping is correct regardless).
+fn api_share(con: &Connection, state: &State, node_id: i64, query: &str) -> ApiResult {
+    let budget: usize = match query_param(query, "budget") {
+        None => 8000,
+        Some(s) => match s.parse::<usize>() {
+            Ok(b) if (100..=100_000).contains(&b) => b,
+            _ => return Ok(Err((400, json!({"error": "budget must be 100..=100000"})))),
+        },
+    };
+
+    let exists: Option<i64> =
+        con.query_row("SELECT id FROM files WHERE id = ?", [node_id], |r| r.get(0)).ok();
+    if exists.is_none() {
+        return Ok(Err((404, json!({"error": "not found"}))));
+    }
+
+    // Built once per server lifetime, on the first share request: a full
+    // `files`/`excluded_families` scan that most `serve` sessions never need.
+    let multi_clone = state.multi_clone.get_or_init(|| {
+        let t0 = Instant::now();
+        let set = share::multi_clone_set(con).unwrap_or_default();
+        eprintln!(
+            "[serve] clone-family set built in {:.1}s ({} families)",
+            t0.elapsed().as_secs_f64(),
+            set.len()
+        );
+        set
+    });
+
+    let node_path = path_for(con, state, node_id)?;
+    let started_at: Option<f64> = con
+        .query_row("SELECT started_at FROM scans ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+        .ok();
+    let scan_date = epoch_to_ymd(started_at.unwrap_or(0.0));
+
+    let inp = share::ShareInput {
+        con,
+        freeable_map: &state.freeable_map,
+        multi_clone,
+    };
+    let Some(result) = share::build_share(&inp, node_id, &node_path, &scan_date, budget)? else {
+        return Ok(Err((400, json!({"error": "budget must be 100..=100000"}))));
+    };
+
+    let base = std::env::var("DUH_SHARE_BASE").unwrap_or_else(|_| DEFAULT_SHARE_BASE.to_string());
+    Ok(Ok(json!({
+        "fragment": result.fragment,
+        "url": format!("{base}#{}", result.fragment),
+        "nodes": result.nodes,
+        "chars": result.chars,
+    })))
+}
+
+/// Look up `key`'s value in a raw (unescaped) query string like `a=1&budget=2`.
+/// Only ever fed numeric query params, so no percent-decoding is needed.
+fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k == key).then_some(v)
+    })
+}
+
+/// Convert a Unix epoch timestamp (seconds, UTC) to a `YYYY-MM-DD` string.
+/// `chrono` is not a dependency; this is Howard Hinnant's `civil_from_days`
+/// (http://howardhinnant.github.io/date_algorithms.html), a small integer-only
+/// algorithm for the proleptic Gregorian calendar.
+fn epoch_to_ymd(epoch_secs: f64) -> String {
+    let days = (epoch_secs / 86400.0).floor() as i64;
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Days since the Unix epoch (1970-01-01) -> (year, month, day), proleptic
+/// Gregorian. Port of Hinnant's `civil_from_days`; correct for the full `i64`
+/// range the algorithm supports (no leap-second handling, as epoch seconds
+/// don't carry them either).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 /// Memoized full path for a node id (port of `_PathCache.get`).
 ///
 /// A poisoned lock is recovered with `into_inner()`: cache entries are complete
@@ -652,6 +764,13 @@ fn build_dir_agg(con: &Connection) -> rusqlite::Result<HashMap<i64, Agg>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn epoch_to_ymd_known_dates() {
+        assert_eq!(epoch_to_ymd(0.0), "1970-01-01");
+        // date -u -r 1752537600 +%F => 2025-07-15
+        assert_eq!(epoch_to_ymd(1_752_537_600.0), "2025-07-15");
+    }
 
     #[test]
     fn host_guard_allows_local_and_rejects_others() {
