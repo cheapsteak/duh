@@ -219,7 +219,14 @@ body {
     crumbEl.style.display = 'flex';
     paneEl.style.display = 'block';
     titleEl.textContent = doc.t;
-    metaEl.innerHTML = 'scanned ' + doc.d + ' · <b>' + fmtBytes(doc.tot) + '</b> freeable';
+    // Built from DOM nodes, never innerHTML: doc.d/doc.t come from the URL
+    // fragment and are attacker-controlled (reflected-XSS surface otherwise).
+    metaEl.textContent = '';
+    metaEl.appendChild(document.createTextNode('scanned ' + doc.d + ' · '));
+    const totB = document.createElement('b');
+    totB.textContent = fmtBytes(doc.tot);
+    metaEl.appendChild(totB);
+    metaEl.appendChild(document.createTextNode(' freeable'));
     document.title = 'duh — ' + doc.t;
 
     chart = echarts.init(document.getElementById('treemap'));
@@ -242,12 +249,32 @@ body {
     const frag = location.hash.slice(1);
     const selftest = /(^|[?&])selftest($|[=&])/.test(location.search);
 
-    if (!frag) { showLanding(); document.title = 'duh — shared disk snapshot'; return; }
+    // In selftest mode every failure surfaces as the FAIL banner so the
+    // release smoke hook has one consistent surface.
+    function selftestFail(reason) {
+      showStatus('fail', 'FAIL — ' + reason);
+      document.title = 'FAIL — duh viewer selftest';
+    }
 
+    if (!frag) {
+      if (selftest) { selftestFail('no fragment'); return; }
+      showLanding();
+      document.title = 'duh — shared disk snapshot';
+      return;
+    }
+
+    // Well-formed fragments are "<digits>.<data>". A missing or non-numeric
+    // version prefix is damage, not a future codec.
     const dot = frag.indexOf('.');
-    const ver = dot >= 0 ? frag.slice(0, dot) : '';
-    const data = dot >= 0 ? frag.slice(dot + 1) : '';
+    if (dot < 0 || !/^\d+$/.test(frag.slice(0, dot))) {
+      if (selftest) { selftestFail('malformed fragment: no version prefix'); return; }
+      damaged('malformed fragment: no version prefix');
+      return;
+    }
+    const ver = frag.slice(0, dot);
+    const data = frag.slice(dot + 1);
     if (ver !== '1') {
+      if (selftest) { selftestFail('unknown format version: ' + ver); return; }
       showStatus('fail', 'This link was made with a newer duh.');
       document.title = 'duh — unsupported link';
       return;
