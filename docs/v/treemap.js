@@ -56,8 +56,11 @@ function buildOption(items) {
       height: '100%',
       label: {
         show: true,
-        // Slivers (<1% of view) render only truncated garbage — show nothing;
-        // the hover tooltip and the table still carry them.
+        // Slivers (<1% of view) render only truncated garbage — show nothing.
+        // No ECharts tooltip picks up the slack: an HTML tooltip would echo
+        // the fragment's file/dir names into the DOM unescaped, an XSS sink
+        // for a name crafted by whoever built the shared link. Deliberately
+        // not enabled.
         formatter: (p) => (p.data.value / total < 0.01)
           ? ''
           : p.data.name + '\n' + fmtBytes(p.data.value),

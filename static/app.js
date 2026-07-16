@@ -346,7 +346,11 @@ function initShareDialog() {
   });
 
   copyBtn.addEventListener('click', async () => {
-    if (!state.currentId) return;
+    // Guard re-entrancy: a second click during the 1.2s "Copied ✓" flash
+    // would otherwise capture that flashed text as `original` and get stuck
+    // showing it forever. Disabling the button for the flash duration closes
+    // that window (and re-enables on revert).
+    if (!state.currentId || copyBtn.disabled) return;
     const tierInput = document.querySelector('input[name="share-tier"]:checked');
     const budget = tierInput ? tierInput.value : '8000';
     try {
@@ -355,8 +359,10 @@ function initShareDialog() {
       localStorage.setItem(SHARE_CONSENT_KEY, '1');
       const original = copyBtn.textContent;
       copyBtn.textContent = 'Copied ✓';
+      copyBtn.disabled = true;
       setTimeout(() => {
         copyBtn.textContent = original;
+        copyBtn.disabled = false;
         closeShareDialog();
       }, 1200);
     } catch (e) {

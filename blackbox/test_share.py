@@ -1,4 +1,6 @@
+import contextlib
 import json, zlib, base64
+import sqlite3
 import pytest
 from conftest import DUH_BIN, EXPECT, approx
 from test_serve import server, _get  # noqa: F401  (fixture + helper reuse)
@@ -54,16 +56,20 @@ def test_share_clone_pair_not_double_counted(server):
 @rust_only
 def test_share_file_node_returns_400(server, scanned):
     """A share request against a FILE id is rejected: build_share only encodes
-    directory subtrees. Per the Task 1 handoff, the known-node/None case maps
-    to 400 (the budget message doubles as the catch-all client error)."""
-    import sqlite3
+    directory subtrees. The node is known to exist, so api_share disambiguates
+    the None with a dedicated "not a shareable directory" message rather than
+    the generic budget message."""
     import urllib.error
-    with sqlite3.connect(scanned.db) as con:
+    with contextlib.closing(
+        sqlite3.connect(f"file:{scanned.db}?mode=ro", uri=True)
+    ) as con:
         (file_id,) = con.execute(
             "SELECT id FROM files WHERE name='u.bin'").fetchone()
     with pytest.raises(urllib.error.HTTPError) as e:
         _get(f"{server}/api/share/{file_id}?budget=8000")
     assert e.value.code == 400
+    body = json.loads(e.value.read())
+    assert body["error"] == "not a shareable directory"
 
 @rust_only
 def test_share_errors(server):

@@ -165,6 +165,8 @@ td.marginal { text-align: right; color: #ffcc66; min-width: 90px; }
   padding: 8px 14px;
   border-bottom: 1px solid #800000;
   display: none;
+  position: relative;
+  z-index: 101; /* above #share-dialog (100) so a failed share is visible */
 }
 .tag-shared {
   display: inline-block;

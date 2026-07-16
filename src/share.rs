@@ -283,12 +283,24 @@ fn visible(arena: &[RNode], child_idx: usize, k: usize) -> bool {
 /// Encode the revealed subtree rooted at `idx` using only reveals in the first
 /// `k` of the sequence: collapse unary chains, append a `["*", residue]` row
 /// when the hidden residue exceeds 0.5% of the node. Port of `encode_tree`.
+///
+/// Each collapse step drops up to ~0.5% residue relative to *its own* node,
+/// but over a deep unary chain those drops compound: dropping 0.5% six times
+/// in a row sheds ~3% of the chain-root's size, comfortably past the 2% slop
+/// the viewer allows when checking a node's size against the sum of its
+/// children — a valid link would then get mis-flagged as "damaged". So this
+/// tracks the running total dropped across the whole chain and stops
+/// collapsing once continuing would exceed ~1% of the chain-root size (the
+/// node at `idx`, before any collapsing) — a safety margin under the 2% slop.
 fn encode_tree(arena: &[RNode], idx: usize, k: usize) -> Value {
     let mut name = arena[idx].name.clone();
     let mut cur = idx;
+    let chain_root_size = arena[idx].size as f64;
+    let mut dropped: u64 = 0;
 
     // Unary chain collapse: a single revealed child with <=0.5% residue folds
-    // into its parent with a `/`-joined name.
+    // into its parent with a `/`-joined name, as long as the chain's
+    // cumulative dropped residue stays under the ~1% cap above.
     loop {
         let vis: Vec<usize> = arena[cur]
             .kids
@@ -298,10 +310,13 @@ fn encode_tree(arena: &[RNode], idx: usize, k: usize) -> Value {
             .collect();
         let sum: u64 = vis.iter().map(|&c| arena[c].size).sum();
         let residue = arena[cur].size.saturating_sub(sum);
+        let would_drop = dropped.saturating_add(residue);
         if arena[cur].is_dir
             && vis.len() == 1
             && (residue as f64) <= arena[cur].size as f64 * 0.005
+            && (would_drop as f64) <= chain_root_size * 0.01
         {
+            dropped = would_drop;
             name.push('/');
             name.push_str(&arena[vis[0]].name);
             cur = vis[0];
@@ -650,6 +665,80 @@ mod tests {
         assert_eq!(n[0].as_str(), Some("a/b/c"));
         assert_eq!(node_size(n), q3(MB as u64));
         assert!(node_kids(n).is_empty(), "collapsed chain leaf has no children");
+    }
+
+    #[test]
+    fn chain_collapse_residue_capped_across_chain() {
+        // A 7-level unary chain of dirs, each ~99.5% of its parent's size, so
+        // every single hop sits right at the existing per-hop 0.5% residue
+        // threshold and would collapse on its own. Naively collapsing the
+        // whole chain would compound to several percent of dropped residue —
+        // comfortably past the 2% slop the viewer allows (`max(2%, 2048)`,
+        // mirrored by `sum_invariant_holds_everywhere` below). The residue
+        // cap must stop the collapse once the running total would exceed
+        // ~1% of the chain-root size, so no encoded node's size-vs-children
+        // gap ever approaches the viewer's threshold.
+        const LEVELS: i64 = 7;
+        let con = new_db();
+        let mut sizes = vec![10_000_000u64];
+        for _ in 1..LEVELS {
+            let prev = *sizes.last().unwrap();
+            sizes.push(prev - prev / 200); // drop ~0.5% each level
+        }
+
+        ins(&con, 1, None, "d0", 1, 0, None, 1);
+        for lvl in 1..LEVELS {
+            ins(&con, lvl + 1, Some(lvl), &format!("d{lvl}"), 1, 0, None, 1);
+        }
+        // Terminal unique file under the last dir, sized to match it exactly
+        // (no extra residue at the final hop).
+        let leaf_size = *sizes.last().unwrap() as i64;
+        ins(&con, LEVELS + 1, Some(LEVELS), "leaf", 0, leaf_size, None, 1);
+
+        let mut fm = HashMap::new();
+        for (i, &s) in sizes.iter().enumerate() {
+            fm.insert(i as i64 + 1, s);
+        }
+        let mc: HashSet<i64> = HashSet::new();
+
+        let inp = ShareInput {
+            con: &con,
+            freeable_map: &fm,
+            multi_clone: &mc,
+        };
+        let res = build_share(&inp, 1, "d0", "2026-07-15", 100_000)
+            .unwrap()
+            .unwrap();
+        let doc = decode(&res.fragment);
+
+        // Same sum-invariant every other test in this module holds encoded
+        // trees to: at every node, |children-sum - node-size| <= max(2%, 2048).
+        fn check(v: &Value) {
+            let kids = node_kids(v);
+            if !kids.is_empty() {
+                let size = node_size(v) as f64;
+                let sum: f64 = kids.iter().map(|k| node_size(k) as f64).sum();
+                let slop = (0.02 * size).max(2048.0);
+                assert!(
+                    (sum - size).abs() <= slop,
+                    "node {:?}: |{sum} - {size}| > {slop}",
+                    v[0]
+                );
+            }
+            for k in kids {
+                check(k);
+            }
+        }
+        check(&doc["n"]);
+
+        // Sanity: the residue cap actually bit — the chain did not fully
+        // collapse into a single "d0/d1/.../d6/leaf" node. A full collapse
+        // would join all LEVELS+1 segments with LEVELS slashes.
+        let name = doc["n"][0].as_str().unwrap();
+        assert!(
+            name.matches('/').count() < LEVELS as usize,
+            "chain fully collapsed despite residue cap: {name}"
+        );
     }
 
     #[test]

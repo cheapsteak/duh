@@ -460,7 +460,7 @@ fn api_node(con: &Connection, state: &State, node_id: i64) -> ApiResult {
     // excluded aggregate) mean deleting this one path frees nothing.
     {
         let mut shared_stmt = con.prepare(
-            "SELECT EXISTS(SELECT 1 FROM files WHERE clone_id = ?1 AND id != ?2) \
+            "SELECT EXISTS(SELECT 1 FROM files WHERE clone_id = ?1 AND id != ?2 AND is_dir=0) \
                  OR EXISTS(SELECT 1 FROM excluded_families WHERE clone_id = ?1)",
         )?;
         for c in children.iter_mut() {
@@ -540,11 +540,14 @@ fn api_breadcrumb(con: &Connection, node_id: i64) -> ApiResult {
 /// `100..=100000`).
 ///
 /// Node existence is checked up front (same query pattern as [`api_node`]) so
-/// unknown ids map to 404. [`share::build_share`] also returns `None` for a
-/// budget too small to fit even the bare root — since the node is known to
-/// exist at that point, that case maps to 400 with the same budget message
-/// (in practice unreachable above the validated 100-char floor, since the
-/// bare-root fragment is far smaller, but the mapping is correct regardless).
+/// unknown ids map to 404, and its `is_dir` is captured for later.
+/// [`share::build_share`] returns `None` for either a non-directory node or a
+/// budget too small to fit even the bare root; since existence is already
+/// confirmed, a `None` is disambiguated by the captured `is_dir`: a file node
+/// gets a distinct "not a shareable directory" 400, while a too-small budget
+/// gets the generic budget message (in practice unreachable above the
+/// validated 100-char floor, since the bare-root fragment is far smaller, but
+/// the mapping is correct regardless).
 fn api_share(con: &Connection, state: &State, node_id: i64, query: &str) -> ApiResult {
     let budget: usize = match query_param(query, "budget") {
         None => 8000,
@@ -554,24 +557,44 @@ fn api_share(con: &Connection, state: &State, node_id: i64, query: &str) -> ApiR
         },
     };
 
-    let exists: Option<i64> =
-        con.query_row("SELECT id FROM files WHERE id = ?", [node_id], |r| r.get(0)).ok();
-    if exists.is_none() {
+    let node_is_dir: Option<i64> =
+        con.query_row("SELECT is_dir FROM files WHERE id = ?", [node_id], |r| r.get(0)).ok();
+    let Some(node_is_dir) = node_is_dir else {
         return Ok(Err((404, json!({"error": "not found"}))));
-    }
+    };
 
     // Built once per server lifetime, on the first share request: a full
     // `files`/`excluded_families` scan that most `serve` sessions never need.
-    let multi_clone = state.multi_clone.get_or_init(|| {
-        let t0 = Instant::now();
-        let set = share::multi_clone_set(con).unwrap_or_default();
-        eprintln!(
-            "[serve] clone-family set built in {:.1}s ({} families)",
-            t0.elapsed().as_secs_f64(),
-            set.len()
-        );
-        set
-    });
+    // Computed to a `Result` first so a query error (e.g. SQLITE_BUSY under a
+    // concurrent scan) never caches an empty set forever — that would make
+    // every future share double-count clone twins. Only a successful build is
+    // stored in the `OnceLock`; on error this request 500s and a later
+    // request gets to retry the build from scratch.
+    let multi_clone: &HashSet<i64> = match state.multi_clone.get() {
+        Some(set) => set,
+        None => {
+            let t0 = Instant::now();
+            match share::multi_clone_set(con) {
+                Ok(set) => {
+                    eprintln!(
+                        "[serve] clone-family set built in {:.1}s ({} families)",
+                        t0.elapsed().as_secs_f64(),
+                        set.len()
+                    );
+                    // Another thread may have won the race to set() first;
+                    // either way `get()` now returns a built set.
+                    let _ = state.multi_clone.set(set);
+                    state.multi_clone.get().expect("just set or set by a racing thread")
+                }
+                Err(e) => {
+                    return Ok(Err((
+                        500,
+                        json!({"error": format!("could not build clone-family set: {e}")}),
+                    )));
+                }
+            }
+        }
+    };
 
     let node_path = path_for(con, state, node_id)?;
     let started_at: Option<f64> = con
@@ -585,6 +608,9 @@ fn api_share(con: &Connection, state: &State, node_id: i64, query: &str) -> ApiR
         multi_clone,
     };
     let Some(result) = share::build_share(&inp, node_id, &node_path, &scan_date, budget)? else {
+        if node_is_dir == 0 {
+            return Ok(Err((400, json!({"error": "not a shareable directory"}))));
+        }
         return Ok(Err((400, json!({"error": "budget must be 100..=100000"}))));
     };
 
