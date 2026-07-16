@@ -132,7 +132,13 @@ is within quantization slop (max(2%, 2 KiB)).
 
 ## Out of scope (recorded levers, not v1)
 
-- brotli-wasm codec (~15-25% smaller; version-prefix ready for it).
+- brotli-wasm codec (measured on real payloads: 13-17% smaller than deflate;
+  version-prefix ready for it; costs a ~200KB wasm decoder in the viewer).
+- lz-string: evaluated 2026-07-16 and REJECTED — measured 31-35% WORSE than
+  deflate+base64url at every tier (LZ78-family, no entropy coding; its
+  URI-safe output is 6 bits/char, the same density as base64, so no
+  encoding-overhead win either), and it would add a viewer JS dep + a Rust
+  port where deflate is native on both ends.
 - Preset dictionary of common macOS path vocabulary (needs pako; helps small
   snapshots most).
 - Binary node encoding (~10-20% pre-compression; hurts debuggability).
