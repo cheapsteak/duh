@@ -15,6 +15,7 @@
     <button class="mode-btn" data-mode="blocks" onclick="setMode('blocks')">Allocated (du)</button>
     <button class="mode-btn" data-mode="logical" onclick="setMode('logical')">Logical</button>
   </div>
+  <button id="share-btn" class="ghost-btn" title="Share this subtree as a link">Share</button>
   <div id="mode-legend" style="font-size:11px;color:#666;flex-shrink:0;max-width:380px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="Freeable = what rm -rf would actually return to df. Allocated double-counts APFS clones (e.g. git worktrees).">
     Freeable = what rm -rf returns to df. Allocated double-counts APFS clones.
   </div>
@@ -37,6 +38,31 @@
   </div>
   <div id="treemap-pane">
     <div id="treemap"></div>
+  </div>
+</div>
+
+<div id="share-dialog" class="hidden">
+  <div id="share-dialog-backdrop"></div>
+  <div id="share-dialog-box">
+    <div id="share-consent"></div>
+    <div id="share-tiers">
+      <label class="share-tier">
+        <input type="radio" name="share-tier" value="1900">
+        <span><b>Compact</b> — fits anywhere, even Discord</span>
+      </label>
+      <label class="share-tier">
+        <input type="radio" name="share-tier" value="8000" checked>
+        <span><b>Standard</b> — Slack/iMessage/Reddit safe</span>
+      </label>
+      <label class="share-tier">
+        <input type="radio" name="share-tier" value="32000">
+        <span><b>Deep</b> — browser-to-browser</span>
+      </label>
+    </div>
+    <div id="share-dialog-actions">
+      <button id="share-cancel" class="ghost-btn">Cancel</button>
+      <button id="share-copy" class="ghost-btn">Copy link</button>
+    </div>
   </div>
 </div>
 

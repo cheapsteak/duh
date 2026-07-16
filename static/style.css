@@ -197,3 +197,74 @@ td.marginal { text-align: right; color: #ffcc66; min-width: 90px; }
   flex-shrink: 0;
   margin-right: 10px;
 }
+.ghost-btn {
+  background: none;
+  border: 1px solid #444;
+  color: #aaa;
+  padding: 3px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+  font-family: inherit;
+  flex-shrink: 0;
+}
+.ghost-btn:hover { color: #7eb8f7; border-color: #7eb8f7; background: rgba(126,184,247,0.08); }
+
+.hidden { display: none !important; }
+
+#share-dialog {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+#share-dialog-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0,0,0,0.6);
+}
+#share-dialog-box {
+  position: relative;
+  background: #1e1e1e;
+  border: 1px solid #444;
+  border-radius: 6px;
+  padding: 20px 22px;
+  width: 420px;
+  max-width: calc(100vw - 40px);
+  box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+  color: #e0e0e0;
+}
+#share-consent {
+  font-size: 13px;
+  line-height: 1.5;
+  color: #ccc;
+  margin-bottom: 16px;
+  word-break: break-word;
+}
+#share-tiers {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 18px;
+}
+.share-tier {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  color: #ccc;
+}
+.share-tier input { accent-color: #7eb8f7; }
+#share-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+#share-dialog-actions .ghost-btn {
+  padding: 5px 14px;
+  font-size: 13px;
+}
+#share-copy:hover { color: #4caf50; border-color: #4caf50; background: rgba(76,175,80,0.08); }

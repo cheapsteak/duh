@@ -69,6 +69,8 @@ def test_api_walk(server, scanned):
 def test_index_and_assets_served(server):
     html = _get(f"{server}/").read().decode()
     assert "duh" in html
+    assert "share-btn" in html
+    assert "share-dialog" in html
 
 
 @rust_only

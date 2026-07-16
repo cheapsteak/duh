@@ -37,6 +37,8 @@ window.addEventListener('DOMContentLoaded', async () => {
     }
   });
 
+  initShareDialog();
+
   // Check URL for deep-link
   const params = new URLSearchParams(window.location.search);
   const startId = params.get('id') ? parseInt(params.get('id')) : null;
@@ -311,6 +313,78 @@ async function apiFetch(path) {
     throw new Error(`HTTP ${res.status}: ${txt}`);
   }
   return res.json();
+}
+
+// ---- share dialog ----
+const SHARE_CONSENT_KEY = 'duh-share-consented';
+
+function initShareDialog() {
+  const shareBtn = document.getElementById('share-btn');
+  const dialog = document.getElementById('share-dialog');
+  const backdrop = document.getElementById('share-dialog-backdrop');
+  const cancelBtn = document.getElementById('share-cancel');
+  const copyBtn = document.getElementById('share-copy');
+
+  function openShareDialog() {
+    if (!state.nodeInfo) {
+      showError('Nothing to share yet.');
+      return;
+    }
+    renderShareConsent();
+    dialog.classList.remove('hidden');
+  }
+
+  function closeShareDialog() {
+    dialog.classList.add('hidden');
+  }
+
+  shareBtn.addEventListener('click', openShareDialog);
+  cancelBtn.addEventListener('click', closeShareDialog);
+  backdrop.addEventListener('click', closeShareDialog);
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !dialog.classList.contains('hidden')) closeShareDialog();
+  });
+
+  copyBtn.addEventListener('click', async () => {
+    if (!state.currentId) return;
+    const tierInput = document.querySelector('input[name="share-tier"]:checked');
+    const budget = tierInput ? tierInput.value : '8000';
+    try {
+      const resp = await apiFetch('/api/share/' + state.currentId + '?budget=' + budget);
+      await navigator.clipboard.writeText(resp.url);
+      localStorage.setItem(SHARE_CONSENT_KEY, '1');
+      const original = copyBtn.textContent;
+      copyBtn.textContent = 'Copied ✓';
+      setTimeout(() => {
+        copyBtn.textContent = original;
+        closeShareDialog();
+      }, 1200);
+    } catch (e) {
+      showError('Share failed: ' + e.message);
+    }
+  });
+}
+
+// SECURITY: state.nodeInfo.path is the real filesystem path being shared —
+// insert it via textContent on a dedicated <b>, never innerHTML/string concat,
+// so a maliciously-named directory can't inject markup into this dialog.
+function renderShareConsent() {
+  const el = document.getElementById('share-consent');
+  el.textContent = '';
+  const consented = localStorage.getItem(SHARE_CONSENT_KEY) === '1';
+  if (consented) {
+    el.appendChild(document.createTextNode('Real names below this folder go into the link.'));
+    return;
+  }
+  const path = (state.nodeInfo && state.nodeInfo.path) || '';
+  el.appendChild(document.createTextNode('Everything below '));
+  const b = document.createElement('b');
+  b.textContent = path;
+  el.appendChild(b);
+  el.appendChild(document.createTextNode(
+    ' — real directory and file names — is encoded into the link itself. ' +
+    'Anyone with the link sees it. Nothing is uploaded anywhere: the data IS the link.'
+  ));
 }
 
 function fmtCount(n) {
