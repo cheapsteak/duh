@@ -615,6 +615,10 @@ mod tests {
         assert_eq!(q3(999), 999);
         assert_eq!(q3(1000), 1000);
         assert_eq!(q3(123_456), 123_000);
+        // Tie boundary pins Python-round() parity (banker's rounding at .5):
+        // python3 -c "print(round(100.5), round(101.5))" -> 100 102
+        assert_eq!(q3(10_050), 10_000); // 100.5 -> 100 (even quotient stays)
+        assert_eq!(q3(10_150), 10_200); // 101.5 -> 102 (odd quotient bumps)
     }
 
     #[test]

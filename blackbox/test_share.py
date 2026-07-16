@@ -37,7 +37,7 @@ def test_share_fragment_decodes_with_invariants(server, scanned):
         assert not errs, errs
 
 @rust_only
-def test_share_clone_pair_not_double_counted(server, scanned):
+def test_share_clone_pair_not_double_counted(server):
     """siblings/x + siblings/y are clones of each other: their files are shared,
     so neither dir may show a file child at full size (the spike's Postgres bug)."""
     root = json.load(_get(f"{server}/api/root"))
@@ -50,6 +50,20 @@ def test_share_clone_pair_not_double_counted(server, scanned):
     x = find(_decode(resp["fragment"])["n"], "x")
     if x and len(x) > 2:
         assert all(k[0] == "*" for k in x[2]), f"shared clone revealed at full size: {x[2]}"
+
+@rust_only
+def test_share_file_node_returns_400(server, scanned):
+    """A share request against a FILE id is rejected: build_share only encodes
+    directory subtrees. Per the Task 1 handoff, the known-node/None case maps
+    to 400 (the budget message doubles as the catch-all client error)."""
+    import sqlite3
+    import urllib.error
+    with sqlite3.connect(scanned.db) as con:
+        (file_id,) = con.execute(
+            "SELECT id FROM files WHERE name='u.bin'").fetchone()
+    with pytest.raises(urllib.error.HTTPError) as e:
+        _get(f"{server}/api/share/{file_id}?budget=8000")
+    assert e.value.code == 400
 
 @rust_only
 def test_share_errors(server):
