@@ -127,6 +127,7 @@ def test_static_asset_content_types(server):
     expected = {
         "/style.css": "text/css",
         "/app.js": "application/javascript",
+        "/treemap.js": "application/javascript",
         "/vendor/echarts.min.js": "application/javascript",
     }
     for path, ctype in expected.items():

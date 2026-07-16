@@ -34,6 +34,7 @@ const DEFAULT_SHARE_BASE: &str = "https://cheapsteak.github.io/duh/v/";
 static INDEX_HTML: &[u8] = include_bytes!("../static/index.html");
 static STYLE_CSS: &[u8] = include_bytes!("../static/style.css");
 static APP_JS: &[u8] = include_bytes!("../static/app.js");
+static TREEMAP_JS: &[u8] = include_bytes!("../static/treemap.js");
 static ECHARTS_JS: &[u8] = include_bytes!("../static/vendor/echarts.min.js");
 
 const NUM_THREADS: usize = 4;
@@ -264,6 +265,7 @@ fn route(
         "/" | "/index.html" => (200, INDEX_HTML.to_vec(), "text/html; charset=utf-8"),
         "/style.css" => (200, STYLE_CSS.to_vec(), "text/css; charset=utf-8"),
         "/app.js" => (200, APP_JS.to_vec(), "application/javascript"),
+        "/treemap.js" => (200, TREEMAP_JS.to_vec(), "application/javascript"),
         "/vendor/echarts.min.js" => (200, ECHARTS_JS.to_vec(), "application/javascript"),
         "/api/root" => json_result(api_root(con)),
         _ if path.starts_with("/api/node/") => {
