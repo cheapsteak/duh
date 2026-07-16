@@ -6,6 +6,10 @@ jobs:
     timeout-minutes: 30 # cap so a hung hdiutil/df poll can't burn the whole runner budget
     steps:
       - uses: actions/checkout@v4
+
+      - name: viewer assets in sync
+        run: sh scripts/sync-viewer.sh && git diff --exit-code docs/v/
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 

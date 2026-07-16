@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>duh — shared disk snapshot</title>
+<style>
+/* Dark styling copied from static/style.css to keep the shared viewer visually
+   consistent with the local duh serve UI. */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: #1a1a1a;
+  color: #e0e0e0;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-size: 13px;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+#header {
+  padding: 8px 14px;
+  background: #111;
+  border-bottom: 1px solid #333;
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  flex-shrink: 0;
+}
+#title { font-weight: bold; color: #e0e0e0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#meta { color: #888; font-size: 12px; white-space: nowrap; flex-shrink: 0; margin-left: auto; }
+#meta b { color: #b0d0ff; font-weight: bold; }
+#breadcrumb {
+  padding: 6px 14px;
+  background: #151515;
+  border-bottom: 1px solid #333;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  overflow-x: auto;
+}
+.crumb { cursor: pointer; color: #7eb8f7; white-space: nowrap; }
+.crumb:hover { text-decoration: underline; }
+.crumb-sep { color: #555; }
+.crumb-cur { color: #e0e0e0; cursor: default; white-space: nowrap; }
+#treemap-pane { flex: 1; overflow: hidden; position: relative; }
+#treemap { width: 100%; height: 100%; }
+#status {
+  padding: 10px 14px;
+  font-weight: bold;
+  flex-shrink: 0;
+  display: none;
+}
+#status.pass { background: #0a3a0a; color: #7fdc7f; border-bottom: 1px solid #1a6a1a; display: block; }
+#status.fail { background: #4a0000; color: #ff8888; border-bottom: 1px solid #800000; display: block; }
+#status.info { background: #1a1a1a; color: #e0e0e0; display: block; }
+#landing {
+  flex: 1;
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 40px;
+  gap: 14px;
+  color: #ccc;
+}
+#landing.show { display: flex; }
+#landing h1 { font-size: 20px; color: #e0e0e0; font-weight: bold; }
+#landing p { max-width: 520px; line-height: 1.6; color: #aaa; }
+#landing a, #footer a { color: #7eb8f7; text-decoration: none; }
+#landing a:hover, #footer a:hover { text-decoration: underline; }
+#footer {
+  padding: 6px 14px;
+  background: #111;
+  border-top: 1px solid #333;
+  color: #666;
+  font-size: 12px;
+  flex-shrink: 0;
+  text-align: right;
+}
+</style>
+</head>
+<body>
+<div id="status"></div>
+<div id="header" style="display:none">
+  <div id="title"></div>
+  <div id="meta"></div>
+</div>
+<div id="breadcrumb" style="display:none"></div>
+<div id="treemap-pane" style="display:none"><div id="treemap"></div></div>
+<div id="landing">
+  <h1>duh — honest disk usage</h1>
+  <p>This page renders a shared <b>duh</b> disk-usage snapshot carried entirely
+     in the link (nothing is uploaded). This link has no snapshot attached.</p>
+  <p><a href="https://github.com/cheapsteak/duh" target="_blank" rel="noopener">
+     Learn about duh on GitHub →</a></p>
+</div>
+<div id="footer">measured by <a href="https://github.com/cheapsteak/duh" target="_blank" rel="noopener">duh</a></div>
+
+<script src="./vendor/echarts.min.js"></script>
+<script src="./treemap.js"></script>
+<script>
+(function () {
+  const { fmtBytes, buildOption } = window.DuhTreemap;
+
+  // ---- decode helpers (validated in the share-url spike / Chrome) ----
+  function b64urlToBytes(s) {
+    s = s.replace(/-/g, '+').replace(/_/g, '/');
+    while (s.length % 4) s += '=';
+    const bin = atob(s);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+  async function inflate(bytes) {
+    // zlib-wrapped deflate — matches python zlib / rust flate2 output.
+    const ds = new DecompressionStream('deflate');
+    const stream = new Blob([bytes]).stream().pipeThrough(ds);
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  }
+  // Sum invariant: visible children + "*" residue must reconstruct the parent
+  // within quantization slop. Returns the node count; pushes failures to errs.
+  function checkSums(node, errs, path) {
+    const size = node[1], kids = node[2];
+    if (!kids) return 1;
+    let sum = 0, cnt = 1;
+    for (const k of kids) {
+      sum += k[1];
+      if (k[0] !== '*') cnt += checkSums(k, errs, path + '/' + k[0]);
+    }
+    const slop = Math.max(size * 0.02, 2048);
+    if (Math.abs(sum - size) > slop) errs.push((path || node[0]) + ': children sum ' + sum + ' vs ' + size);
+    return cnt;
+  }
+
+  // ---- DOM handles ----
+  const statusEl = document.getElementById('status');
+  const headerEl = document.getElementById('header');
+  const titleEl = document.getElementById('title');
+  const metaEl = document.getElementById('meta');
+  const crumbEl = document.getElementById('breadcrumb');
+  const paneEl = document.getElementById('treemap-pane');
+  const landingEl = document.getElementById('landing');
+
+  function showStatus(cls, text) {
+    statusEl.className = cls;
+    statusEl.textContent = text;
+  }
+  function showLanding() { landingEl.classList.add('show'); }
+  function damaged(reason) {
+    // console keeps the technical reason; the banner stays human.
+    if (reason) console.error('duh viewer:', reason);
+    showStatus('fail', 'This link appears damaged.');
+    document.title = 'duh — damaged link';
+  }
+
+  // ---- navigation state ----
+  let doc = null;
+  let chart = null;
+  const stack = [];      // nodes from root to current view
+  let navMap = {};       // tile id -> child node (dirs only)
+
+  function isDir(node) { return node.length > 2 && node[2] && node[2].length > 0; }
+
+  function render() {
+    const current = stack[stack.length - 1];
+    const kids = current[2] || [];
+    navMap = {};
+    const items = kids.map(function (k, i) {
+      if (k[0] === '*') {
+        // residue row — inert, labeled "… other"
+        return { name: '… other', value: k[1] };
+      }
+      if (isDir(k)) {
+        const id = 'n' + i;
+        navMap[id] = k;
+        return { name: k[0], value: k[1], id: id };
+      }
+      return { name: k[0], value: k[1] }; // leaf — inert
+    });
+    chart.setOption(buildOption(items), true);
+    renderBreadcrumb();
+  }
+
+  function renderBreadcrumb() {
+    crumbEl.innerHTML = '';
+    stack.forEach(function (node, i) {
+      if (i > 0) {
+        const sep = document.createElement('span');
+        sep.className = 'crumb-sep';
+        sep.textContent = '›';
+        crumbEl.appendChild(sep);
+      }
+      const c = document.createElement('span');
+      const label = i === 0 ? (doc.t || node[0]) : node[0];
+      if (i === stack.length - 1) {
+        c.className = 'crumb-cur';
+        c.textContent = label;
+      } else {
+        c.className = 'crumb';
+        c.textContent = label;
+        c.addEventListener('click', function () {
+          stack.length = i + 1;
+          render();
+        });
+      }
+      crumbEl.appendChild(c);
+    });
+  }
+
+  function navUp() {
+    if (stack.length > 1) { stack.pop(); render(); }
+  }
+
+  function startViewer() {
+    headerEl.style.display = 'flex';
+    crumbEl.style.display = 'flex';
+    paneEl.style.display = 'block';
+    titleEl.textContent = doc.t;
+    metaEl.innerHTML = 'scanned ' + doc.d + ' · <b>' + fmtBytes(doc.tot) + '</b> freeable';
+    document.title = 'duh — ' + doc.t;
+
+    chart = echarts.init(document.getElementById('treemap'));
+    chart.on('click', function (p) {
+      if (p && p.data && p.data.id && navMap[p.data.id]) {
+        stack.push(navMap[p.data.id]);
+        render();
+      }
+    });
+    window.addEventListener('resize', function () { chart && chart.resize(); });
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') navUp(); });
+
+    stack.length = 0;
+    stack.push(doc.n);
+    render();
+  }
+
+  // ---- boot ----
+  (async function () {
+    const frag = location.hash.slice(1);
+    const selftest = /(^|[?&])selftest($|[=&])/.test(location.search);
+
+    if (!frag) { showLanding(); document.title = 'duh — shared disk snapshot'; return; }
+
+    const dot = frag.indexOf('.');
+    const ver = dot >= 0 ? frag.slice(0, dot) : '';
+    const data = dot >= 0 ? frag.slice(dot + 1) : '';
+    if (ver !== '1') {
+      showStatus('fail', 'This link was made with a newer duh.');
+      document.title = 'duh — unsupported link';
+      return;
+    }
+
+    try {
+      const t0 = performance.now();
+      const raw = await inflate(b64urlToBytes(data));
+      doc = JSON.parse(new TextDecoder().decode(raw));
+      if (!doc || doc.v !== 1 || !Array.isArray(doc.n)) throw new Error('bad document shape');
+
+      // Belt-and-braces: a corrupt-but-inflatable link is caught here.
+      const errs = [];
+      const nodeCount = checkSums(doc.n, errs, '');
+      if (errs.length) throw new Error('sum invariant failed: ' + errs.slice(0, 5).join('; '));
+      const ms = (performance.now() - t0).toFixed(1);
+
+      startViewer();
+
+      if (selftest) {
+        showStatus('pass', 'PASS — decoded ' + nodeCount + ' nodes in ' + ms + 'ms');
+        document.title = 'PASS — duh viewer selftest';
+      }
+    } catch (e) {
+      if (selftest) {
+        showStatus('fail', 'FAIL — ' + e.message);
+        document.title = 'FAIL — duh viewer selftest';
+      } else {
+        damaged(e.message);
+      }
+    }
+  })();
+})();
+</script>
+</body>
+</html>
