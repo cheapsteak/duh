@@ -245,21 +245,17 @@ td.marginal { text-align: right; color: #ffcc66; min-width: 90px; }
   margin-bottom: 16px;
   word-break: break-word;
 }
-#share-tiers {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  margin-bottom: 18px;
+#share-error {
+  font-size: 12px;
+  line-height: 1.4;
+  color: #ff8888;
+  background: #4a0000;
+  border: 1px solid #800000;
+  border-radius: 4px;
+  padding: 8px 10px;
+  margin-bottom: 16px;
+  word-break: break-word;
 }
-.share-tier {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  cursor: pointer;
-  font-size: 13px;
-  color: #ccc;
-}
-.share-tier input { accent-color: #7eb8f7; }
 #share-dialog-actions {
   display: flex;
   justify-content: flex-end;

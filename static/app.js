@@ -336,6 +336,7 @@ function initShareDialog() {
 
   function closeShareDialog() {
     dialog.classList.add('hidden');
+    hideShareError();
   }
 
   shareBtn.addEventListener('click', openShareDialog);
@@ -346,29 +347,59 @@ function initShareDialog() {
   });
 
   copyBtn.addEventListener('click', async () => {
-    // Guard re-entrancy: a second click during the 1.2s "Copied ✓" flash
-    // would otherwise capture that flashed text as `original` and get stuck
-    // showing it forever. Disabling the button for the flash duration closes
-    // that window (and re-enables on revert).
+    // Guard re-entrancy: a second click while a request is in flight (or
+    // during the 1.2s "Copied ✓" flash) would otherwise create a second gist,
+    // or capture the flashed text as `original` and get stuck showing it
+    // forever. Disabling the button for both windows closes that off.
     if (!state.currentId || copyBtn.disabled) return;
-    const tierInput = document.querySelector('input[name="share-tier"]:checked');
-    const budget = tierInput ? tierInput.value : '8000';
+    hideShareError();
+    const original = copyBtn.textContent;
+    copyBtn.disabled = true;
     try {
-      const resp = await apiFetch('/api/share/' + state.currentId + '?budget=' + budget);
+      const resp = await apiFetch('/api/share/' + state.currentId);
       await navigator.clipboard.writeText(resp.url);
       localStorage.setItem(SHARE_CONSENT_KEY, '1');
-      const original = copyBtn.textContent;
       copyBtn.textContent = 'Copied ✓';
-      copyBtn.disabled = true;
       setTimeout(() => {
         copyBtn.textContent = original;
         copyBtn.disabled = false;
         closeShareDialog();
       }, 1200);
     } catch (e) {
-      showError('Share failed: ' + e.message);
+      copyBtn.textContent = original;
+      copyBtn.disabled = false;
+      showShareError(shareErrorMessage(e));
     }
   });
+}
+
+// apiFetch throws `Error("HTTP <status>: <raw body text>")` on non-2xx. The
+// share endpoint's error body is JSON `{"error": "<message>"}` — pull that
+// message out for display; fall back to the raw exception text if the body
+// isn't the expected shape (defensive, shouldn't happen against this server).
+function shareErrorMessage(e) {
+  const msg = e && e.message || String(e);
+  const i = msg.indexOf(': ');
+  const body = i === -1 ? msg : msg.slice(i + 2);
+  try {
+    const parsed = JSON.parse(body);
+    if (parsed && typeof parsed.error === 'string') return parsed.error;
+  } catch (_) {
+    // not JSON — fall through to raw text
+  }
+  return body;
+}
+
+function showShareError(msg) {
+  const el = document.getElementById('share-error');
+  el.textContent = msg;
+  el.classList.remove('hidden');
+}
+
+function hideShareError() {
+  const el = document.getElementById('share-error');
+  el.textContent = '';
+  el.classList.add('hidden');
 }
 
 // SECURITY: state.nodeInfo.path is the real filesystem path being shared —
@@ -379,17 +410,20 @@ function renderShareConsent() {
   el.textContent = '';
   const consented = localStorage.getItem(SHARE_CONSENT_KEY) === '1';
   if (consented) {
-    el.appendChild(document.createTextNode('Real names below this folder go into the link.'));
+    el.appendChild(document.createTextNode(
+      'Uploads a snapshot to a secret gist on your GitHub.'
+    ));
     return;
   }
   const path = (state.nodeInfo && state.nodeInfo.path) || '';
-  el.appendChild(document.createTextNode('Everything below '));
+  el.appendChild(document.createTextNode('This uploads a snapshot of everything below '));
   const b = document.createElement('b');
   b.textContent = path;
   el.appendChild(b);
   el.appendChild(document.createTextNode(
-    ' — real directory and file names — is encoded into the link itself. ' +
-    'Anyone with the link sees it. Nothing is uploaded anywhere: the data IS the link.'
+    ' — real directory and file names — to a secret (unlisted) gist on your GitHub account. ' +
+    'Anyone with the link can open it; it is not searchable, and you can delete it anytime at ' +
+    'gist.github.com. Nothing is access-controlled: treat the link as the secret.'
   ));
 }
 
