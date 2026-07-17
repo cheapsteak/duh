@@ -278,8 +278,7 @@ fn route(
             dispatch_id(&path["/api/breadcrumb/".len()..], |id| api_breadcrumb(con, id))
         }
         _ if path.starts_with("/api/share/") => {
-            let query = raw_url.split_once('?').map(|(_, q)| q).unwrap_or("");
-            dispatch_id(&path["/api/share/".len()..], |id| api_share(con, state, id, query))
+            dispatch_id(&path["/api/share/".len()..], |id| api_share(con, state, id))
         }
         _ => json_response(&json!({"error": "not found"}), 404),
     }
@@ -535,28 +534,22 @@ fn api_breadcrumb(con: &Connection, node_id: i64) -> ApiResult {
     Ok(Ok(Value::Array(crumbs)))
 }
 
-/// `GET /api/share/{id}?budget=N` — a shareable URL fragment for the subtree
-/// rooted at `id`, sized to fit `budget` characters (default 8000, clamped to
-/// `100..=100000`).
+/// `GET /api/share/{id}` — uploads a full snapshot of the subtree rooted at
+/// `id` to a SECRET GitHub gist (via [`create_gist`]) and returns the viewer
+/// URL. Pivoted 2026-07-17 (`docs/superpowers/specs/2026-07-15-share-urls-design.md`):
+/// no more `budget` query param or URL-fragment link — the snapshot is built
+/// at [`share::FULL_BUDGET`] (bounded by the reveal cap, not a char budget)
+/// and shipped off-URL as a secret gist instead.
 ///
 /// Node existence is checked up front (same query pattern as [`api_node`]) so
 /// unknown ids map to 404, and its `is_dir` is captured for later.
 /// [`share::build_share`] returns `None` for either a non-directory node or a
-/// budget too small to fit even the bare root; since existence is already
+/// snapshot that can't fit even `FULL_BUDGET` (not reachable in practice —
+/// the bare-root fragment is a few hundred bytes); since existence is already
 /// confirmed, a `None` is disambiguated by the captured `is_dir`: a file node
-/// gets a distinct "not a shareable directory" 400, while a too-small budget
-/// gets the generic budget message (in practice unreachable above the
-/// validated 100-char floor, since the bare-root fragment is far smaller, but
-/// the mapping is correct regardless).
-fn api_share(con: &Connection, state: &State, node_id: i64, query: &str) -> ApiResult {
-    let budget: usize = match query_param(query, "budget") {
-        None => 8000,
-        Some(s) => match s.parse::<usize>() {
-            Ok(b) if (100..=100_000).contains(&b) => b,
-            _ => return Ok(Err((400, json!({"error": "budget must be 100..=100000"})))),
-        },
-    };
-
+/// gets the "not a shareable directory" 400, anything else a 500 (a genuine
+/// invariant violation, not a user-facing budget knob anymore).
+fn api_share(con: &Connection, state: &State, node_id: i64) -> ApiResult {
     let node_is_dir: Option<i64> =
         con.query_row("SELECT is_dir FROM files WHERE id = ?", [node_id], |r| r.get(0)).ok();
     let Some(node_is_dir) = node_is_dir else {
@@ -607,29 +600,117 @@ fn api_share(con: &Connection, state: &State, node_id: i64, query: &str) -> ApiR
         freeable_map: &state.freeable_map,
         multi_clone,
     };
-    let Some(result) = share::build_share(&inp, node_id, &node_path, &scan_date, budget)? else {
+    let Some(result) = share::build_share(&inp, node_id, &node_path, &scan_date, share::FULL_BUDGET)?
+    else {
         if node_is_dir == 0 {
             return Ok(Err((400, json!({"error": "not a shareable directory"}))));
         }
-        return Ok(Err((400, json!({"error": "budget must be 100..=100000"}))));
+        return Ok(Err((
+            500,
+            json!({"error": "internal error: could not build snapshot"}),
+        )));
     };
 
-    let base = std::env::var("DUH_SHARE_BASE").unwrap_or_else(|_| DEFAULT_SHARE_BASE.to_string());
-    Ok(Ok(json!({
-        "fragment": result.fragment,
-        "url": format!("{base}#{}", result.fragment),
-        "nodes": result.nodes,
-        "chars": result.chars,
-    })))
+    match create_gist(&result.fragment) {
+        Ok(gist_id) => {
+            let base =
+                std::env::var("DUH_SHARE_BASE").unwrap_or_else(|_| DEFAULT_SHARE_BASE.to_string());
+            Ok(Ok(json!({
+                "url": format!("{base}?gist={gist_id}"),
+                "gist_id": gist_id,
+                "nodes": result.nodes,
+            })))
+        }
+        Err(GistError::Missing) => Ok(Err((
+            400,
+            json!({"error": "Sharing needs the GitHub CLI (gh) installed and signed in."}),
+        ))),
+        Err(GistError::Failed(detail)) => Ok(Err((
+            502,
+            json!({"error": format!("gist creation failed: {detail}")}),
+        ))),
+    }
 }
 
-/// Look up `key`'s value in a raw (unescaped) query string like `a=1&budget=2`.
-/// Only ever fed numeric query params, so no percent-decoding is needed.
-fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
-    query.split('&').find_map(|kv| {
-        let (k, v) = kv.split_once('=')?;
-        (k == key).then_some(v)
-    })
+/// Why [`create_gist`] failed. Distinguishes "gh isn't installed" (ENOENT on
+/// spawn — a 400, actionable by the user installing/authing `gh`) from every
+/// other failure (a non-installed-CLI problem — a 502, since the failure is
+/// on GitHub's/gh's side, not the request's).
+enum GistError {
+    /// The `gh` binary could not be found (`std::io::ErrorKind::NotFound`
+    /// spawning it), or gave output that couldn't be parsed for a gist id.
+    Missing,
+    /// `gh` ran but exited nonzero, or some other I/O error occurred running
+    /// it. Carries a short human-readable detail (trimmed stderr where
+    /// available).
+    Failed(String),
+}
+
+/// Upload `fragment` (a share snapshot, `1.<base64>`) as a SECRET gist via
+/// `<DUH_GH_BIN or "gh"> gist create <tempfile> -d "duh disk snapshot"`, and
+/// return the gist id parsed from the trailing `https://gist.github.com/<user>/<id>`
+/// line of its stdout.
+///
+/// `gh gist create` has no `--secret` flag — gists are secret by default, and
+/// only `--public`/`-p` opts into public (verified against real `gh` 2.73.0;
+/// passing a nonexistent `--secret` flag makes it error out). So "secret
+/// only" here means simply never passing `--public`/`-p` — the default is
+/// already what we want.
+///
+/// The fragment is written to a fixed-name temp file (`duh-snapshot.txt` in
+/// `std::env::temp_dir()`) rather than piped to `gh`'s stdin, because `gh gist
+/// create` needs a real filename to pick a sensible default gist filename.
+/// The path is server-generated (never derived from user input), and `gh` is
+/// invoked via `Command` with an argument vector — no shell is involved, so
+/// there is no shell-injection surface. The temp file is removed on every
+/// return path.
+fn create_gist(fragment: &str) -> Result<String, GistError> {
+    let path = std::env::temp_dir().join("duh-snapshot.txt");
+    if let Err(e) = std::fs::write(&path, fragment) {
+        return Err(GistError::Failed(format!("could not write snapshot file: {e}")));
+    }
+
+    let gh_bin = std::env::var("DUH_GH_BIN").unwrap_or_else(|_| "gh".to_string());
+    let output = std::process::Command::new(&gh_bin)
+        .arg("gist")
+        .arg("create")
+        .arg(&path)
+        .arg("-d")
+        .arg("duh disk snapshot")
+        .output();
+
+    let result = match output {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            match stdout.lines().rev().find_map(parse_gist_id) {
+                Some(id) => Ok(id),
+                None => Err(GistError::Failed(
+                    "could not parse gist id from gh output".to_string(),
+                )),
+            }
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let detail = if stderr.is_empty() {
+                format!("gh exited with status {}", out.status)
+            } else {
+                stderr
+            };
+            Err(GistError::Failed(detail))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(GistError::Missing),
+        Err(e) => Err(GistError::Failed(format!("could not run gh: {e}"))),
+    };
+
+    let _ = std::fs::remove_file(&path);
+    result
+}
+
+/// Parse a trailing `https://gist.github.com/<user>/<id>` line into `<id>`.
+fn parse_gist_id(line: &str) -> Option<String> {
+    let rest = line.trim().strip_prefix("https://gist.github.com/")?;
+    let id = rest.rsplit('/').next()?;
+    (!id.is_empty()).then(|| id.to_string())
 }
 
 /// Convert a Unix epoch timestamp (seconds, UTC) to a `YYYY-MM-DD` string.

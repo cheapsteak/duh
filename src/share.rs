@@ -58,6 +58,14 @@ pub fn multi_clone_set(
     rows.collect()
 }
 
+/// Budget for a full snapshot (secret-gist transport, pivoted 2026-07-17: no
+/// more URL-fragment char budget). Gists comfortably hold multi-MB text
+/// files, so this is deliberately far larger than any real fragment gets —
+/// large enough that [`build_reveal_sequence`]'s `MAX_REVEALS` (~20k nodes)
+/// bounds the snapshot, not this budget. Callers building a share snapshot
+/// for upload should pass this instead of a char-count budget.
+pub const FULL_BUDGET: usize = 8_000_000;
+
 /// Build a share snapshot for `node_id` (titled `node_path`, scanned on
 /// `scan_date`) whose fragment fits within `budget` characters.
 ///
