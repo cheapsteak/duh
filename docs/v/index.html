@@ -92,8 +92,9 @@ body {
 <div id="treemap-pane" style="display:none"><div id="treemap"></div></div>
 <div id="landing">
   <h1>duh — honest disk usage</h1>
-  <p>This page renders a shared <b>duh</b> disk-usage snapshot carried entirely
-     in the link (nothing is uploaded). This link has no snapshot attached.</p>
+  <p>This page renders disk-usage snapshots shared with <b>duh</b>'s Share
+     button. A shared snapshot opens here automatically via its link — this
+     link has no snapshot attached.</p>
   <p><a href="https://github.com/cheapsteak/duh" target="_blank" rel="noopener">
      Learn about duh on GitHub →</a></p>
 </div>
@@ -246,7 +247,7 @@ body {
 
   // ---- boot ----
   (async function () {
-    const frag = location.hash.slice(1);
+    let frag = location.hash.slice(1);
     const selftest = /(^|[?&])selftest($|[=&])/.test(location.search);
 
     // In selftest mode every failure surfaces as the FAIL banner so the
@@ -254,6 +255,30 @@ body {
     function selftestFail(reason) {
       showStatus('fail', 'FAIL — ' + reason);
       document.title = 'FAIL — duh viewer selftest';
+    }
+
+    // Secret-gist transport (2026-07-17 pivot): the data lives in a gist,
+    // not the URL. `?gist=<id>` is fetched via the GitHub API (CORS `*`
+    // on gists), and the first file's content becomes the SAME `1.<frag>`
+    // string the old fragment transport used — everything downstream
+    // (version check, inflate, checkSums, startViewer) is unchanged.
+    // `id` is attacker-influenced (it's a URL param), so any message that
+    // includes it goes through showStatus/textContent, never innerHTML.
+    const gistId = new URLSearchParams(location.search).get('gist');
+    if (gistId) {
+      try {
+        showStatus('info', 'loading shared snapshot…');
+        const meta = await fetch('https://api.github.com/gists/' + encodeURIComponent(gistId))
+          .then(function (r) { if (!r.ok) throw new Error('gist ' + r.status); return r.json(); });
+        const files = meta && meta.files ? Object.values(meta.files) : [];
+        if (!files.length) throw new Error('gist has no files');
+        const file = files[0];
+        frag = (file.truncated ? await fetch(file.raw_url).then(function (r) { return r.text(); }) : file.content).trim();
+      } catch (e) {
+        if (selftest) { selftestFail('gist fetch: ' + e.message); return; }
+        showStatus('fail', 'Could not load this shared snapshot: ' + e.message);
+        return;
+      }
     }
 
     if (!frag) {
