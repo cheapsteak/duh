@@ -72,7 +72,13 @@ Algorithm:
 1. Build the reveal sequence: priority queue of hidden children of revealed
    dirs, keyed by size (dirs: freeable_map; files: serve-layer file rule),
    popping the globally largest until exhausted or a hard cap (~20k reveals).
-   Sizes ≤ 0 never enter the queue.
+   Sizes ≤ 0 never enter the queue. **Depth-biased default:** only the
+   `REVEAL_FANOUT` (=3) largest children of any directory are eligible for the
+   queue; the rest fold into that directory's `*` residue. This spends the
+   fixed byte budget on depth instead of breadth — measured on a real scan,
+   deep-tier max depth 17→24 (+24% nodes), standard-tier 14→17. The root is
+   capped too (smaller top-level dirs fold into "… other"). Change
+   `REVEAL_FANOUT` to trade depth back for breadth.
 2. Binary-search the longest sequence prefix whose encoded fragment fits the
    budget. Encoding a prefix: revealed tree → chain collapse → `*` residue
    rows → quantize → compact JSON → deflate (level 9) → base64url.

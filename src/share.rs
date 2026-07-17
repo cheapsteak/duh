@@ -197,6 +197,25 @@ fn q3(n: u64) -> u64 {
 /// Build the full revealed tree and the global reveal sequence. Returns the
 /// arena (index 0 is the root) and `seq`, where `seq[i]` is the arena index of
 /// the `i`-th revealed node. Port of the spike's `build_reveal_sequence`.
+/// Per-directory reveal fanout cap: only the `REVEAL_FANOUT` largest children
+/// of a revealed directory are ever pushed onto the reveal queue; the rest
+/// are never revealed and fold into that directory's `*` residue (via
+/// `encode_tree`'s existing sum-based residue computation — no extra
+/// bookkeeping needed, since a hidden child simply never becomes part of the
+/// arena's `kids` sum).
+///
+/// This spends the fixed URL-fragment budget on *depth* instead of *breadth*:
+/// capping fanout lets the reveal sequence dive into far fewer, deeper
+/// subtrees rather than exhausting the budget listing many siblings at a
+/// shallow level. Measured on a real scan, this took the deep tier's max
+/// depth from 17 to 24 (+24% nodes) and the standard tier's from 14 to 17.
+/// The cap applies uniformly, including the root's own children — a big scan
+/// root will fold its smaller top-level directories into an "other" residue
+/// row same as any other directory.
+///
+/// Tune this constant to change the depth/breadth tradeoff.
+const REVEAL_FANOUT: usize = 3;
+
 fn build_reveal_sequence(
     inp: &ShareInput,
     root_id: i64,
@@ -246,8 +265,10 @@ fn build_reveal_sequence(
     Ok((arena, seq))
 }
 
-/// Queue every positive-size child of `node_idx` onto the reveal heap. Sizes
-/// `<= 0` never enter the queue (spike invariant).
+/// Queue the top [`REVEAL_FANOUT`] positive-size children of `node_idx` onto
+/// the reveal heap, largest first. Sizes `<= 0` never enter the queue (spike
+/// invariant); children beyond the fanout cap are simply never queued, so
+/// they can never be revealed and fold into `node_idx`'s `*` residue.
 fn push_children(
     inp: &ShareInput,
     arena: &mut [RNode],
@@ -256,19 +277,25 @@ fn push_children(
     node_idx: usize,
 ) -> rusqlite::Result<()> {
     let node_id = arena[node_idx].id;
-    for row in children_of(inp.con, node_id)? {
-        let sz = size_of(&row, inp);
-        if sz <= 0 {
-            continue;
-        }
+    let mut eligible: Vec<(u64, ChildRow)> = children_of(inp.con, node_id)?
+        .into_iter()
+        .filter_map(|row| {
+            let sz = size_of(&row, inp);
+            (sz > 0).then_some((sz as u64, row))
+        })
+        .collect();
+    // Sort descending by size; a stable sort keeps DB order as the tiebreak
+    // among equal sizes, matching the global heap's insertion-order tiebreak.
+    eligible.sort_by(|a, b| b.0.cmp(&a.0));
+    for (sz, row) in eligible.into_iter().take(REVEAL_FANOUT) {
         let tie = cands.len() as u64;
         cands.push(Cand {
             parent: node_idx,
-            size: sz as u64,
+            size: sz,
             row,
         });
         heap.push(HeapItem {
-            size: sz as u64,
+            size: sz,
             tie: Reverse(tie),
         });
     }
@@ -752,6 +779,92 @@ mod tests {
         assert!(build_share(&inp, 999, "?", "2026-07-15", 100_000)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn fanout_capped_to_top_three() {
+        // Root has 5 unique, unshared files of distinct decreasing sizes.
+        // Even with a budget large enough to reveal everything, only the top
+        // REVEAL_FANOUT=3 may ever enter the reveal queue; the rest fold into
+        // the root's `*` residue.
+        let con = new_db();
+        ins(&con, 1, None, "root", 1, 0, None, 1);
+        let sizes: [i64; 5] = [100 * MB, 90 * MB, 80 * MB, 70 * MB, 60 * MB];
+        for (i, &sz) in sizes.iter().enumerate() {
+            ins(&con, 10 + i as i64, Some(1), &format!("f{i}"), 0, sz, None, 1);
+        }
+        let mut fm = HashMap::new();
+        fm.insert(1, sizes.iter().sum::<i64>() as u64);
+        let mc: HashSet<i64> = HashSet::new();
+
+        let inp = ShareInput {
+            con: &con,
+            freeable_map: &fm,
+            multi_clone: &mc,
+        };
+        let res = build_share(&inp, 1, "root", "2026-07-15", 1_000_000)
+            .unwrap()
+            .unwrap();
+        let doc = decode(&res.fragment);
+        let n = &doc["n"];
+        let kids = node_kids(n);
+
+        let non_star: Vec<&Value> = kids.iter().filter(|k| k[0].as_str() != Some("*")).collect();
+        assert_eq!(non_star.len(), 3, "expected exactly top-3 fanout: {kids:?}");
+
+        let mut revealed: Vec<u64> = non_star.iter().map(|k| node_size(k)).collect();
+        revealed.sort_unstable_by(|a, b| b.cmp(a));
+        assert_eq!(
+            revealed,
+            vec![q3((100 * MB) as u64), q3((90 * MB) as u64), q3((80 * MB) as u64)],
+            "the three revealed children must be the three largest"
+        );
+
+        let star = kids
+            .iter()
+            .find(|k| k[0].as_str() == Some("*"))
+            .expect("hidden children (beyond fanout cap) must fold into `*` residue");
+        let expected_hidden = q3((70 * MB + 60 * MB) as u64);
+        let got = node_size(star) as f64;
+        let slop = (0.02 * expected_hidden as f64).max(2048.0);
+        assert!(
+            (got - expected_hidden as f64).abs() <= slop,
+            "* residue {got} should equal hidden sum {expected_hidden} within slop {slop}"
+        );
+    }
+
+    #[test]
+    fn fanout_shows_all_children_when_at_or_below_cap() {
+        // Exactly REVEAL_FANOUT=3 children, sized to sum exactly to the
+        // parent: all three must reveal and there must be no spurious `*`
+        // row (residue is 0, well under the 0.5% threshold).
+        let con = new_db();
+        ins(&con, 1, None, "root", 1, 0, None, 1);
+        let sizes: [i64; 3] = [50 * MB, 30 * MB, 20 * MB];
+        for (i, &sz) in sizes.iter().enumerate() {
+            ins(&con, 10 + i as i64, Some(1), &format!("f{i}"), 0, sz, None, 1);
+        }
+        let mut fm = HashMap::new();
+        fm.insert(1, sizes.iter().sum::<i64>() as u64);
+        let mc: HashSet<i64> = HashSet::new();
+
+        let inp = ShareInput {
+            con: &con,
+            freeable_map: &fm,
+            multi_clone: &mc,
+        };
+        let res = build_share(&inp, 1, "root", "2026-07-15", 1_000_000)
+            .unwrap()
+            .unwrap();
+        let doc = decode(&res.fragment);
+        let n = &doc["n"];
+        let kids = node_kids(n);
+
+        assert_eq!(kids.len(), 3, "all three children should reveal: {kids:?}");
+        assert!(
+            kids.iter().all(|k| k[0].as_str() != Some("*")),
+            "no spurious `*` residue row expected: {kids:?}"
+        );
     }
 
     #[test]
