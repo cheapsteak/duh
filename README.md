@@ -64,14 +64,37 @@ itself as the secret, same as you would a screenshot. You can delete a shared
 snapshot at any time from <https://gist.github.com> (find it in your gists
 list, or via `gh gist delete <id>`).
 
-## Quickstart
+## Install
 
-Install the binary onto your `PATH` (`duh`), then:
+**Download the prebuilt binary** — macOS, universal (Apple Silicon + Intel).
+Latest release: <https://github.com/cheapsteak/duh/releases/latest>.
 
 ```sh
-# Build & install from source
-cargo install --path .        # or: cargo build --release → ./target/release/duh
+curl -L -o duh.tar.gz https://github.com/cheapsteak/duh/releases/download/v3.1.0/duh-3.1.0-macos-universal.tar.gz
+tar -xzf duh.tar.gz
+xattr -d com.apple.quarantine ./duh    # unsigned binary — clears the Gatekeeper block
+./duh --version
+```
 
+The `xattr` step is needed because the binary isn't code-signed or notarized
+(that requires a paid Apple Developer account); without it macOS blocks it with
+"cannot be opened because the developer cannot be verified." Move it onto your
+`PATH` (e.g. `mv duh /usr/local/bin/`) to run it as just `duh`.
+
+**Or build from source** — needs the [Rust toolchain](https://rustup.rs)
+(`brew install rust`):
+
+```sh
+git clone https://github.com/cheapsteak/duh && cd duh
+cargo install --path .        # or: cargo build --release → ./target/release/duh
+```
+
+Requires macOS on APFS. The **Share** feature additionally needs the `gh` CLI
+signed in (`gh auth login`).
+
+## Quickstart
+
+```sh
 # 1. Verify clone detection works on your filesystem
 duh selftest
 
