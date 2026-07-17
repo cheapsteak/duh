@@ -212,17 +212,21 @@ fn q3(n: u64) -> u64 {
 /// bookkeeping needed, since a hidden child simply never becomes part of the
 /// arena's `kids` sum).
 ///
-/// This spends the fixed URL-fragment budget on *depth* instead of *breadth*:
-/// capping fanout lets the reveal sequence dive into far fewer, deeper
-/// subtrees rather than exhausting the budget listing many siblings at a
-/// shallow level. Measured on a real scan, this took the deep tier's max
-/// depth from 17 to 24 (+24% nodes) and the standard tier's from 14 to 17.
-/// The cap applies uniformly, including the root's own children — a big scan
-/// root will fold its smaller top-level directories into an "other" residue
-/// row same as any other directory.
+/// This biases the reveal toward *depth* over *breadth*: capping fanout lets
+/// the reveal dive into deeper subtrees rather than listing every sibling at a
+/// shallow level. The cap applies uniformly, including the root's own children
+/// — a big scan root folds its smaller top-level directories into an "other"
+/// residue row same as any other directory.
 ///
-/// Tune this constant to change the depth/breadth tradeoff.
-const REVEAL_FANOUT: usize = 3;
+/// The value is tuned for the gist transport (no URL-length limit; the ~20k
+/// node reveal cap is what bounds the snapshot). Measured on a real full-volume
+/// scan at that budget: 8 keeps the tree deep (max depth ~22) while folding
+/// only ~1.6 GiB into the root's "other" — versus 3, which was deeper (~30) but
+/// buried ~25 GiB of top-level directories in "other", too aggressive now that
+/// gists have room. Raise it for even more breadth (diminishing past ~8, since
+/// the node cap binds first and most directories have fewer children); lower it
+/// to trade breadth back for depth.
+const REVEAL_FANOUT: usize = 8;
 
 fn build_reveal_sequence(
     inp: &ShareInput,
@@ -790,14 +794,17 @@ mod tests {
     }
 
     #[test]
-    fn fanout_capped_to_top_three() {
-        // Root has 5 unique, unshared files of distinct decreasing sizes.
-        // Even with a budget large enough to reveal everything, only the top
-        // REVEAL_FANOUT=3 may ever enter the reveal queue; the rest fold into
-        // the root's `*` residue.
+    fn fanout_capped_to_reveal_fanout() {
+        // Root has REVEAL_FANOUT + 2 unique, unshared files of distinct
+        // decreasing sizes. Even with a budget large enough to reveal
+        // everything, only the top REVEAL_FANOUT may ever enter the reveal
+        // queue; the two smallest fold into the root's `*` residue.
+        let extra = 2usize;
+        let count = REVEAL_FANOUT + extra;
         let con = new_db();
         ins(&con, 1, None, "root", 1, 0, None, 1);
-        let sizes: [i64; 5] = [100 * MB, 90 * MB, 80 * MB, 70 * MB, 60 * MB];
+        // Sizes: (count)*10 MB down to 10 MB, strictly decreasing and distinct.
+        let sizes: Vec<i64> = (0..count).map(|i| ((count - i) as i64) * 10 * MB).collect();
         for (i, &sz) in sizes.iter().enumerate() {
             ins(&con, 10 + i as i64, Some(1), &format!("f{i}"), 0, sz, None, 1);
         }
@@ -814,25 +821,29 @@ mod tests {
             .unwrap()
             .unwrap();
         let doc = decode(&res.fragment);
-        let n = &doc["n"];
-        let kids = node_kids(n);
+        let kids = node_kids(&doc["n"]);
 
         let non_star: Vec<&Value> = kids.iter().filter(|k| k[0].as_str() != Some("*")).collect();
-        assert_eq!(non_star.len(), 3, "expected exactly top-3 fanout: {kids:?}");
-
-        let mut revealed: Vec<u64> = non_star.iter().map(|k| node_size(k)).collect();
-        revealed.sort_unstable_by(|a, b| b.cmp(a));
         assert_eq!(
-            revealed,
-            vec![q3((100 * MB) as u64), q3((90 * MB) as u64), q3((80 * MB) as u64)],
-            "the three revealed children must be the three largest"
+            non_star.len(),
+            REVEAL_FANOUT,
+            "expected exactly REVEAL_FANOUT ({REVEAL_FANOUT}) revealed children: {kids:?}"
         );
 
+        // The revealed children must be the REVEAL_FANOUT largest.
+        let mut revealed: Vec<u64> = non_star.iter().map(|k| node_size(k)).collect();
+        revealed.sort_unstable_by(|a, b| b.cmp(a));
+        let expected_revealed: Vec<u64> =
+            sizes.iter().take(REVEAL_FANOUT).map(|&s| q3(s as u64)).collect();
+        assert_eq!(revealed, expected_revealed, "must reveal the largest children");
+
+        // The `extra` smallest fold into a single `*` residue row.
+        let hidden_sum: i64 = sizes.iter().skip(REVEAL_FANOUT).sum();
         let star = kids
             .iter()
             .find(|k| k[0].as_str() == Some("*"))
             .expect("hidden children (beyond fanout cap) must fold into `*` residue");
-        let expected_hidden = q3((70 * MB + 60 * MB) as u64);
+        let expected_hidden = q3(hidden_sum as u64);
         let got = node_size(star) as f64;
         let slop = (0.02 * expected_hidden as f64).max(2048.0);
         assert!(
@@ -843,9 +854,9 @@ mod tests {
 
     #[test]
     fn fanout_shows_all_children_when_at_or_below_cap() {
-        // Exactly REVEAL_FANOUT=3 children, sized to sum exactly to the
-        // parent: all three must reveal and there must be no spurious `*`
-        // row (residue is 0, well under the 0.5% threshold).
+        // Three children (at or below the fanout cap), sized to sum exactly to
+        // the parent: all must reveal and there must be no spurious `*` row
+        // (residue is 0, well under the 0.5% threshold).
         let con = new_db();
         ins(&con, 1, None, "root", 1, 0, None, 1);
         let sizes: [i64; 3] = [50 * MB, 30 * MB, 20 * MB];
