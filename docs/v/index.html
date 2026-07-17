@@ -55,6 +55,7 @@ body {
 #status.pass { background: #0a3a0a; color: #7fdc7f; border-bottom: 1px solid #1a6a1a; display: block; }
 #status.fail { background: #4a0000; color: #ff8888; border-bottom: 1px solid #800000; display: block; }
 #status.info { background: #1a1a1a; color: #e0e0e0; display: block; }
+#status.hidden { display: none; }
 #landing {
   flex: 1;
   display: none;
@@ -148,6 +149,10 @@ body {
   function showStatus(cls, text) {
     statusEl.className = cls;
     statusEl.textContent = text;
+  }
+  function hideStatus() {
+    statusEl.className = 'hidden';
+    statusEl.textContent = '';
   }
   function showLanding() { landingEl.classList.add('show'); }
   function damaged(reason) {
@@ -268,12 +273,21 @@ body {
     if (gistId) {
       try {
         showStatus('info', 'loading shared snapshot…');
-        const meta = await fetch('https://api.github.com/gists/' + encodeURIComponent(gistId))
+        // AbortSignal.timeout: a hung api.github.com (or raw_url) must not
+        // leave the loading banner up forever — it should error into the
+        // catch below like any other fetch failure.
+        const meta = await fetch('https://api.github.com/gists/' + encodeURIComponent(gistId), { signal: AbortSignal.timeout(20000) })
           .then(function (r) { if (!r.ok) throw new Error('gist ' + r.status); return r.json(); });
         const files = meta && meta.files ? Object.values(meta.files) : [];
         if (!files.length) throw new Error('gist has no files');
-        const file = files[0];
-        frag = (file.truncated ? await fetch(file.raw_url).then(function (r) { return r.text(); }) : file.content).trim();
+        // Prefer the file whose content starts with the fragment shape
+        // ("<digits>.") over files[0] (gist files sort alphabetically) —
+        // a user editing the gist and adding a new first-sorting file
+        // shouldn't break the link. Falls back to files[0] if none match.
+        const file = files.find(function (f) {
+          return f && typeof f.content === 'string' && /^\d+\./.test(f.content);
+        }) || files[0];
+        frag = (file.truncated ? await fetch(file.raw_url, { signal: AbortSignal.timeout(20000) }).then(function (r) { return r.text(); }) : file.content).trim();
       } catch (e) {
         if (selftest) { selftestFail('gist fetch: ' + e.message); return; }
         showStatus('fail', 'Could not load this shared snapshot: ' + e.message);
@@ -322,6 +336,13 @@ body {
       if (selftest) {
         showStatus('pass', 'PASS — decoded ' + nodeCount + ' nodes in ' + ms + 'ms');
         document.title = 'PASS — duh viewer selftest';
+      } else {
+        // Clear the "loading shared snapshot…" banner (set above for the
+        // ?gist= path) now that the treemap has rendered — otherwise it sits
+        // on top of the viewer forever in normal (non-selftest) mode. The
+        // fragment (#1.) path never showed this banner, so this is a no-op
+        // there (statusEl.className is already '').
+        hideStatus();
       }
     } catch (e) {
       if (selftest) {

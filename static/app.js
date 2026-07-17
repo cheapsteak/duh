@@ -306,8 +306,8 @@ function showError(msg) {
   el.style.display = 'block';
 }
 
-async function apiFetch(path) {
-  const res = await fetch(path);
+async function apiFetch(path, options) {
+  const res = await fetch(path, options);
   if (!res.ok) {
     const txt = await res.text();
     throw new Error(`HTTP ${res.status}: ${txt}`);
@@ -326,6 +326,8 @@ function initShareDialog() {
   const copyBtn = document.getElementById('share-copy');
 
   function openShareDialog() {
+    // Relies on closeShareDialog() having already hidden the share-error element
+    // from any previous attempt (dialogs are re-opened, not recreated).
     if (!state.nodeInfo) {
       showError('Nothing to share yet.');
       return;
@@ -356,7 +358,11 @@ function initShareDialog() {
     const original = copyBtn.textContent;
     copyBtn.disabled = true;
     try {
-      const resp = await apiFetch('/api/share/' + state.currentId);
+      // /api/share has a side effect (a gist upload), so it's CSRF-guarded on
+      // the server: this custom header can't be set by a cross-site fetch
+      // without a CORS preflight, which this same-origin request never needs
+      // but a cross-site one would fail (see src/serve.rs share_csrf_guard).
+      const resp = await apiFetch('/api/share/' + state.currentId, {headers: {'X-Duh-Share': '1'}});
       await navigator.clipboard.writeText(resp.url);
       localStorage.setItem(SHARE_CONSENT_KEY, '1');
       copyBtn.textContent = 'Copied ✓';

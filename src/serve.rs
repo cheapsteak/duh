@@ -26,8 +26,9 @@ use tiny_http::{Header, Response, Server};
 use crate::freeable;
 use crate::share;
 
-/// Default base URL for share fragments, overridable via `DUH_SHARE_BASE`
-/// (e.g. for local development against a different viewer deployment).
+/// Default base URL for the `?gist=` snapshot viewer, overridable via
+/// `DUH_SHARE_BASE` (e.g. for local development against a different viewer
+/// deployment).
 const DEFAULT_SHARE_BASE: &str = "https://cheapsteak.github.io/duh/v/";
 
 // --- embedded static assets (Rust-only; the oracle serves inline HTML) --------
@@ -62,6 +63,10 @@ struct State {
     /// built lazily on the first `/api/share` request since it costs a full
     /// `files`/`excluded_families` scan that most `serve` sessions never need.
     multi_clone: OnceLock<HashSet<i64>>,
+    /// The port this server actually bound to (after the port-range fallback),
+    /// used by the `/api/share` CSRF guard to validate an `Origin` header
+    /// against `http://127.0.0.1:<port>` / `http://localhost:<port>`.
+    port: u16,
 }
 
 /// (free, total) bytes on the volume containing `path`, or None on failure.
@@ -112,17 +117,9 @@ pub fn run(db_path: &Path, port: u16, no_browser: bool) -> ExitCode {
         .map(PathBuf::from);
     drop(con);
 
-    let state = Arc::new(State {
-        db_path: db_path.to_path_buf(),
-        dir_agg,
-        freeable_map,
-        locked_here_map,
-        path_cache: Mutex::new(HashMap::new()),
-        scan_root,
-        multi_clone: OnceLock::new(),
-    });
-
     // Bind, trying up to port+10 (port range fallback, `reference/duh-py:2988-2997`).
+    // Done before building `State` so the actually-bound port is known and can
+    // be recorded for the `/api/share` CSRF guard's `Origin` check.
     let max_port = port.saturating_add(10);
     let mut server = None;
     let mut bound_port = port;
@@ -144,6 +141,17 @@ pub fn run(db_path: &Path, port: u16, no_browser: bool) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    let state = Arc::new(State {
+        db_path: db_path.to_path_buf(),
+        dir_agg,
+        freeable_map,
+        locked_here_map,
+        path_cache: Mutex::new(HashMap::new()),
+        scan_root,
+        multi_clone: OnceLock::new(),
+        port: bound_port,
+    });
 
     let url = format!("http://127.0.0.1:{bound_port}/");
     eprintln!("[serve] listening on {url}");
@@ -277,11 +285,45 @@ fn route(
         _ if path.starts_with("/api/breadcrumb/") => {
             dispatch_id(&path["/api/breadcrumb/".len()..], |id| api_breadcrumb(con, id))
         }
-        _ if path.starts_with("/api/share/") => {
-            dispatch_id(&path["/api/share/".len()..], |id| api_share(con, state, id))
-        }
+        _ if path.starts_with("/api/share/") => match share_csrf_guard(state, headers) {
+            Some(forbidden) => forbidden,
+            None => dispatch_id(&path["/api/share/".len()..], |id| api_share(con, state, id)),
+        },
         _ => json_response(&json!({"error": "not found"}), 404),
     }
+}
+
+/// CSRF guard for `/api/share` ONLY — the other `/api/*` routes are read-only
+/// and stay Host-guard-only; this route has a side effect (an actual gist
+/// upload to the user's GitHub account via their local `gh` auth), so a
+/// cross-site page must not be able to trigger it with a bare `fetch`.
+///
+/// Requires a custom `X-Duh-Share: 1` request header. Rationale: a cross-site
+/// page cannot set a custom header on a request without triggering a CORS
+/// preflight, and this server never sends `Access-Control-Allow-*` headers,
+/// so the browser refuses to send the actual request cross-site — the
+/// `X-Duh-Share` header requirement blocks the attack before the handler
+/// ever runs. The `Origin` check below is defense-in-depth only (e.g.
+/// against a browser bug or a non-browser client that ignores CORS): if
+/// `Origin` is present, it must be this server's own `http://127.0.0.1:<port>`
+/// or `http://localhost:<port>`.
+///
+/// Returns `Some(403 response)` to reject, `None` to let the request through.
+fn share_csrf_guard(state: &State, headers: &[Header]) -> Option<(u16, Vec<u8>, &'static str)> {
+    let has_share_header =
+        headers.iter().any(|h| h.field.equiv("X-Duh-Share") && h.value.as_str() == "1");
+    if !has_share_header {
+        return Some(json_response(&json!({"error": "forbidden"}), 403));
+    }
+    if let Some(origin) = headers.iter().find(|h| h.field.equiv("Origin")).map(|h| h.value.as_str())
+    {
+        let allowed_a = format!("http://127.0.0.1:{}", state.port);
+        let allowed_b = format!("http://localhost:{}", state.port);
+        if origin != allowed_a && origin != allowed_b {
+            return Some(json_response(&json!({"error": "forbidden"}), 403));
+        }
+    }
+    None
 }
 
 /// Parse an id path segment and dispatch, mapping a bad id to 400 (the oracle's

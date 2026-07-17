@@ -17,7 +17,7 @@ Ratified decisions (supersede the 2026-07-15 table where they conflict):
 |---|---|
 | Transport | **Secret gist only.** URL-fragment share links are no longer generated. The viewer's fragment-decode code stays (a gist stores the same `1.<base64>` fragment string; also used by `?selftest`). |
 | Gist visibility | **Secret always** (unlisted, unguessable 128-bit id, deletable). No public option. Secret is obscurity, not access control — the consent copy must say so. |
-| Gist creation | Server-side: `duh serve` shells out to `gh gist create --secret` (reuses the user's existing `gh auth`). If `gh` is absent/unauthed, the Share button shows a clear error. Overridable binary via `DUH_GH_BIN` (default `gh`) so tests inject a stub. |
+| Gist creation | Server-side: `duh serve` shells out to `gh gist create` (gists are secret by default; never passes `--public`) (reuses the user's existing `gh auth`). If `gh` is absent/unauthed, the Share button shows a clear error. Overridable binary via `DUH_GH_BIN` (default `gh`) so tests inject a stub. |
 | GitHub required | Yes — sharing now needs `gh` authenticated. The account-free URL escape hatch is intentionally removed. |
 | Tiers | **Dropped.** One full snapshot (depth-biased top-3 reveal up to the ~20k-node cap); gists have room. Dialog is just consent + Copy link. |
 | Privacy model | Data is **uploaded to a secret gist on the sharer's account** (was: never uploaded). Deletable at gist.github.com. Consent dialog rewritten accordingly. |
