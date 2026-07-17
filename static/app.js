@@ -1,4 +1,6 @@
-const fmtBytes = DuhTreemap.fmtBytes;
+// fmtBytes is a global provided by treemap.js (loaded before this script);
+// don't redeclare it here — a `const fmtBytes` in this shared global scope
+// collides with treemap.js's `function fmtBytes` ("already declared").
 
 // ---- global state ----
 const state = {
