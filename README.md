@@ -50,21 +50,19 @@ rather than being silently attributed to one of them.
 
 ## Sharing
 
-The **Share** button in the treemap header turns the current snapshot into a
-link you can hand to someone else. It offers three tiers by how much of the
-tree to include:
+The **Share** button in the treemap header (in `duh serve`) uploads a
+snapshot of the currently-viewed subtree to a **secret (unlisted) GitHub
+gist** on your own account, and copies a link to the static viewer at
+<https://cheapsteak.github.io/duh/v/> that renders it as an explorable
+treemap. This requires the [`gh` CLI](https://cli.github.com/) installed and
+signed in (`gh auth login`) — if it isn't, the button shows a clear error
+instead of silently failing.
 
-- **Compact** — the top few levels; short enough to paste into Discord or a chat box.
-- **Standard** — a deeper cut that still fits in a Slack message or Reddit comment.
-- **Deep** — the biggest slice, for sending browser-to-browser where long URLs are fine.
-
-The picked subtree is deflate-compressed and packed into the URL **fragment**
-(everything after `#`), then opened on the static viewer at
-<https://cheapsteak.github.io/duh/v/>. Because it lives in the fragment, the
-snapshot never leaves the browser — it is not sent to any server, not the
-viewer's host and not us. Privacy model in one line: your directory names go
-into the link, so anyone you give the link to can read them — share it as
-deliberately as you would a screenshot.
+"Secret" means unlisted and effectively unguessable (a random id), **not**
+access-controlled: anyone who has the link can view it, so treat the link
+itself as the secret, same as you would a screenshot. You can delete a shared
+snapshot at any time from <https://gist.github.com> (find it in your gists
+list, or via `gh gist delete <id>`).
 
 ## Quickstart
 
