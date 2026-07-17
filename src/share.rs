@@ -212,21 +212,27 @@ fn q3(n: u64) -> u64 {
 /// bookkeeping needed, since a hidden child simply never becomes part of the
 /// arena's `kids` sum).
 ///
-/// This biases the reveal toward *depth* over *breadth*: capping fanout lets
-/// the reveal dive into deeper subtrees rather than listing every sibling at a
-/// shallow level. The cap applies uniformly, including the root's own children
-/// — a big scan root folds its smaller top-level directories into an "other"
-/// residue row same as any other directory.
+/// Per-directory reveal policy: a child is eligible for the reveal queue when
+/// its size is at least [`SHARE_MIN_FRACTION`] of its parent's size. Everything
+/// smaller folds into the parent's `*` ("… other") residue. This adapts to the
+/// directory: `/Applications` (dozens of similar-sized apps) shows nearly all
+/// of them, while a flat directory of thousands of tiny files collapses its
+/// long tail — where a fixed top-N cap would bury real content in "other"
+/// regardless of N.
 ///
-/// The value is tuned for the gist transport (no URL-length limit; the ~20k
-/// node reveal cap is what bounds the snapshot). Measured on a real full-volume
-/// scan at that budget: 8 keeps the tree deep (max depth ~22) while folding
-/// only ~1.6 GiB into the root's "other" — versus 3, which was deeper (~30) but
-/// buried ~25 GiB of top-level directories in "other", too aggressive now that
-/// gists have room. Raise it for even more breadth (diminishing past ~8, since
-/// the node cap binds first and most directories have fewer children); lower it
-/// to trade breadth back for depth.
-const REVEAL_FANOUT: usize = 8;
+/// A floor of [`SHARE_MIN_FANOUT`] guarantees a directory whose children are
+/// all below the fraction still shows its largest few; a ceiling of
+/// [`SHARE_MAX_FANOUT`] is a safety valve against a pathological directory with
+/// hundreds of near-equal children (unreadable as a treemap level — the
+/// fraction alone already bounds eligibility to ≤ 1/SHARE_MIN_FRACTION).
+///
+/// Tuned for the gist transport (no URL-length limit; the ~20k-node reveal cap
+/// bounds the snapshot). Measured on a real full-volume scan: `/Applications`
+/// went from 8 apps shown / ~15 GiB in "other" (old fixed top-8) to ~48 shown /
+/// ~0.5 GiB, at the same ~170 KB gist size. Lower the fraction to fold less.
+const SHARE_MIN_FRACTION: f64 = 0.003;
+const SHARE_MIN_FANOUT: usize = 3;
+const SHARE_MAX_FANOUT: usize = 200;
 
 fn build_reveal_sequence(
     inp: &ShareInput,
@@ -277,10 +283,12 @@ fn build_reveal_sequence(
     Ok((arena, seq))
 }
 
-/// Queue the top [`REVEAL_FANOUT`] positive-size children of `node_idx` onto
-/// the reveal heap, largest first. Sizes `<= 0` never enter the queue (spike
-/// invariant); children beyond the fanout cap are simply never queued, so
-/// they can never be revealed and fold into `node_idx`'s `*` residue.
+/// Queue the eligible positive-size children of `node_idx` onto the reveal
+/// heap, largest first. Eligibility: size `>= SHARE_MIN_FRACTION` of the
+/// parent's size, clamped to `[SHARE_MIN_FANOUT, SHARE_MAX_FANOUT]` of the
+/// largest children. Sizes `<= 0` never enter the queue (spike invariant);
+/// ineligible children are never queued, so they fold into `node_idx`'s `*`
+/// residue.
 fn push_children(
     inp: &ShareInput,
     arena: &mut [RNode],
@@ -289,6 +297,7 @@ fn push_children(
     node_idx: usize,
 ) -> rusqlite::Result<()> {
     let node_id = arena[node_idx].id;
+    let parent_size = arena[node_idx].size;
     let mut eligible: Vec<(u64, ChildRow)> = children_of(inp.con, node_id)?
         .into_iter()
         .filter_map(|row| {
@@ -299,7 +308,12 @@ fn push_children(
     // Sort descending by size; a stable sort keeps DB order as the tiebreak
     // among equal sizes, matching the global heap's insertion-order tiebreak.
     eligible.sort_by(|a, b| b.0.cmp(&a.0));
-    for (sz, row) in eligible.into_iter().take(REVEAL_FANOUT) {
+    // Take the leading run of children at or above the fraction threshold, but
+    // never fewer than the floor nor more than the ceiling.
+    let threshold = (parent_size as f64 * SHARE_MIN_FRACTION) as u64;
+    let above = eligible.iter().take_while(|(sz, _)| *sz >= threshold).count();
+    let take = above.clamp(SHARE_MIN_FANOUT, SHARE_MAX_FANOUT).min(eligible.len());
+    for (sz, row) in eligible.into_iter().take(take) {
         let tie = cands.len() as u64;
         cands.push(Cand {
             parent: node_idx,
@@ -794,22 +808,24 @@ mod tests {
     }
 
     #[test]
-    fn fanout_capped_to_reveal_fanout() {
-        // Root has REVEAL_FANOUT + 2 unique, unshared files of distinct
-        // decreasing sizes. Even with a budget large enough to reveal
-        // everything, only the top REVEAL_FANOUT may ever enter the reveal
-        // queue; the two smallest fold into the root's `*` residue.
-        let extra = 2usize;
-        let count = REVEAL_FANOUT + extra;
+    fn fraction_threshold_folds_small_tail() {
+        // Parent = 1000 MB. Five "big" children (100 MB each = 10% > 0.3%) and
+        // five "tiny" children (1 MB each = 0.1% < 0.3%). The threshold is
+        // 1000 MB * 0.003 = 3 MB, so the five big reveal and the five tiny fold
+        // into one `*` residue. (Above the SHARE_MIN_FANOUT floor, so the floor
+        // doesn't affect this.)
         let con = new_db();
         ins(&con, 1, None, "root", 1, 0, None, 1);
-        // Sizes: (count)*10 MB down to 10 MB, strictly decreasing and distinct.
-        let sizes: Vec<i64> = (0..count).map(|i| ((count - i) as i64) * 10 * MB).collect();
-        for (i, &sz) in sizes.iter().enumerate() {
-            ins(&con, 10 + i as i64, Some(1), &format!("f{i}"), 0, sz, None, 1);
+        let big = 100 * MB;
+        let tiny = MB;
+        for i in 0..5 {
+            ins(&con, 10 + i, Some(1), &format!("big{i}"), 0, big, None, 1);
+        }
+        for i in 0..5 {
+            ins(&con, 100 + i, Some(1), &format!("tiny{i}"), 0, tiny, None, 1);
         }
         let mut fm = HashMap::new();
-        fm.insert(1, sizes.iter().sum::<i64>() as u64);
+        fm.insert(1, (5 * big + 5 * tiny) as u64);
         let mc: HashSet<i64> = HashSet::new();
 
         let inp = ShareInput {
@@ -824,31 +840,55 @@ mod tests {
         let kids = node_kids(&doc["n"]);
 
         let non_star: Vec<&Value> = kids.iter().filter(|k| k[0].as_str() != Some("*")).collect();
-        assert_eq!(
-            non_star.len(),
-            REVEAL_FANOUT,
-            "expected exactly REVEAL_FANOUT ({REVEAL_FANOUT}) revealed children: {kids:?}"
+        assert_eq!(non_star.len(), 5, "the five ≥0.3% children must reveal: {kids:?}");
+        assert!(
+            non_star.iter().all(|k| node_size(k) == q3(big as u64)),
+            "revealed children are all the big ones"
         );
 
-        // The revealed children must be the REVEAL_FANOUT largest.
-        let mut revealed: Vec<u64> = non_star.iter().map(|k| node_size(k)).collect();
-        revealed.sort_unstable_by(|a, b| b.cmp(a));
-        let expected_revealed: Vec<u64> =
-            sizes.iter().take(REVEAL_FANOUT).map(|&s| q3(s as u64)).collect();
-        assert_eq!(revealed, expected_revealed, "must reveal the largest children");
-
-        // The `extra` smallest fold into a single `*` residue row.
-        let hidden_sum: i64 = sizes.iter().skip(REVEAL_FANOUT).sum();
         let star = kids
             .iter()
             .find(|k| k[0].as_str() == Some("*"))
-            .expect("hidden children (beyond fanout cap) must fold into `*` residue");
-        let expected_hidden = q3(hidden_sum as u64);
+            .expect("the five tiny children must fold into `*` residue");
+        let expected_hidden = q3((5 * tiny) as u64);
         let got = node_size(star) as f64;
         let slop = (0.02 * expected_hidden as f64).max(2048.0);
         assert!(
             (got - expected_hidden as f64).abs() <= slop,
-            "* residue {got} should equal hidden sum {expected_hidden} within slop {slop}"
+            "* residue {got} should equal hidden tiny sum {expected_hidden} within slop {slop}"
+        );
+    }
+
+    #[test]
+    fn fraction_floor_shows_largest_when_all_below_threshold() {
+        // Parent = 1000 MB, six children each 2 MB (0.2% < 0.3% threshold of
+        // 3 MB): none is eligible by fraction, so the SHARE_MIN_FANOUT floor
+        // reveals the largest three and folds the rest.
+        let con = new_db();
+        ins(&con, 1, None, "root", 1, 0, None, 1);
+        let each = 2 * MB;
+        for i in 0..6 {
+            ins(&con, 10 + i, Some(1), &format!("f{i}"), 0, each, None, 1);
+        }
+        let mut fm = HashMap::new();
+        // Parent much larger than the sum of children so every child is < 0.3%.
+        fm.insert(1, (1000 * MB) as u64);
+        let mc: HashSet<i64> = HashSet::new();
+
+        let inp = ShareInput {
+            con: &con,
+            freeable_map: &fm,
+            multi_clone: &mc,
+        };
+        let res = build_share(&inp, 1, "root", "2026-07-15", 1_000_000)
+            .unwrap()
+            .unwrap();
+        let doc = decode(&res.fragment);
+        let kids = node_kids(&doc["n"]);
+        let non_star = kids.iter().filter(|k| k[0].as_str() != Some("*")).count();
+        assert_eq!(
+            non_star, SHARE_MIN_FANOUT,
+            "with all children below the fraction, the floor reveals SHARE_MIN_FANOUT: {kids:?}"
         );
     }
 
