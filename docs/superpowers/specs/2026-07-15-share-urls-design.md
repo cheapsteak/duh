@@ -1,9 +1,33 @@
 # duh Share URLs — Design
 
-Shareable, explorable treemap snapshots carried entirely in a URL fragment,
-viewed on a static GitHub Pages page. No backend, no storage, links only.
+Shareable, explorable treemap snapshots viewed on a static GitHub Pages page.
 
-## Decisions (ratified in brainstorming, 2026-07-15)
+## Pivot (2026-07-17): secret-gist transport, URL sharing removed
+
+The URL-fragment transport shipped first (see below) but capped snapshots at
+~2,800 nodes. Verified that a GitHub gist's **raw URL sends
+`access-control-allow-origin: *`** (public AND secret gists), so a static page
+can fetch it client-side; a secret gist served a 5 MB file whole. Prototype
+proven end-to-end in a real browser: a 10,071-node / depth-33 snapshot of the
+real disk rendered from `?gist=<id>` with no data in the URL.
+
+Ratified decisions (supersede the 2026-07-15 table where they conflict):
+
+| Question | Decision |
+|---|---|
+| Transport | **Secret gist only.** URL-fragment share links are no longer generated. The viewer's fragment-decode code stays (a gist stores the same `1.<base64>` fragment string; also used by `?selftest`). |
+| Gist visibility | **Secret always** (unlisted, unguessable 128-bit id, deletable). No public option. Secret is obscurity, not access control — the consent copy must say so. |
+| Gist creation | Server-side: `duh serve` shells out to `gh gist create --secret` (reuses the user's existing `gh auth`). If `gh` is absent/unauthed, the Share button shows a clear error. Overridable binary via `DUH_GH_BIN` (default `gh`) so tests inject a stub. |
+| GitHub required | Yes — sharing now needs `gh` authenticated. The account-free URL escape hatch is intentionally removed. |
+| Tiers | **Dropped.** One full snapshot (depth-biased top-3 reveal up to the ~20k-node cap); gists have room. Dialog is just consent + Copy link. |
+| Privacy model | Data is **uploaded to a secret gist on the sharer's account** (was: never uploaded). Deletable at gist.github.com. Consent dialog rewritten accordingly. |
+| Viewer entry | `https://cheapsteak.github.io/duh/v/?gist=<id>` — fetches the gist via the GitHub API (CORS `*`; inlines content <1 MB, follows `raw_url` above), then the existing decode/render path. |
+
+Everything below (encoder algorithm, snapshot format, clone-aware sizing,
+depth-biased reveal, viewer decode + XSS discipline, sum invariant) is
+unchanged and still binding.
+
+## Decisions (original URL transport, ratified 2026-07-15 — superseded above)
 
 | Question | Decision |
 |---|---|
