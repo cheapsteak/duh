@@ -638,12 +638,24 @@ fn api_share(con: &Connection, state: &State, node_id: i64) -> ApiResult {
 /// on GitHub's/gh's side, not the request's).
 enum GistError {
     /// The `gh` binary could not be found (`std::io::ErrorKind::NotFound`
-    /// spawning it), or gave output that couldn't be parsed for a gist id.
+    /// spawning it). Maps to a 400.
     Missing,
-    /// `gh` ran but exited nonzero, or some other I/O error occurred running
-    /// it. Carries a short human-readable detail (trimmed stderr where
-    /// available).
+    /// `gh` ran but exited nonzero, its output couldn't be parsed for a gist
+    /// id, or some other I/O error occurred running it. Carries a short
+    /// human-readable detail (trimmed stderr where available). Maps to a 502.
     Failed(String),
+}
+
+/// Removes a temp file when dropped, so every exit path out of [`create_gist`]
+/// — write failure (possibly partway through, leaving bytes on disk), gh
+/// missing, gh nonzero, id-parse failure, or success — cleans up the snapshot
+/// file exactly once. Best-effort: a failed unlink (already gone, permissions)
+/// is ignored.
+struct TempFileGuard(PathBuf);
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// Upload `fragment` (a share snapshot, `1.<base64>`) as a SECRET gist via
@@ -657,15 +669,24 @@ enum GistError {
 /// only" here means simply never passing `--public`/`-p` — the default is
 /// already what we want.
 ///
-/// The fragment is written to a fixed-name temp file (`duh-snapshot.txt` in
-/// `std::env::temp_dir()`) rather than piped to `gh`'s stdin, because `gh gist
-/// create` needs a real filename to pick a sensible default gist filename.
-/// The path is server-generated (never derived from user input), and `gh` is
+/// The fragment is written to a temp file (in `std::env::temp_dir()`) rather
+/// than piped to `gh`'s stdin, because `gh gist create` needs a real filename
+/// to pick a sensible default gist filename. The filename is unique per call
+/// — `duh-snapshot-<pid>-<seq>.txt`, where `<seq>` comes from a process-wide
+/// atomic counter — so concurrent `/api/share` requests across the worker
+/// pool can never clobber each other's file or unlink one mid-`gh`-read. The
+/// path is server-generated (never derived from user input), and `gh` is
 /// invoked via `Command` with an argument vector — no shell is involved, so
-/// there is no shell-injection surface. The temp file is removed on every
-/// return path.
+/// there is no shell-injection surface. A [`TempFileGuard`] removes the file
+/// on every return path (including a partial write that failed midway).
 fn create_gist(fragment: &str) -> Result<String, GistError> {
-    let path = std::env::temp_dir().join("duh-snapshot.txt");
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("duh-snapshot-{}-{seq}.txt", std::process::id()));
+
+    // Create the guard BEFORE writing, so even a write that fails partway
+    // through (e.g. disk full on a big real snapshot) still gets cleaned up.
+    let _guard = TempFileGuard(path.clone());
     if let Err(e) = std::fs::write(&path, fragment) {
         return Err(GistError::Failed(format!("could not write snapshot file: {e}")));
     }
@@ -679,7 +700,8 @@ fn create_gist(fragment: &str) -> Result<String, GistError> {
         .arg("duh disk snapshot")
         .output();
 
-    let result = match output {
+    // `_guard` unlinks the temp file when this function returns, on every arm.
+    match output {
         Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             match stdout.lines().rev().find_map(parse_gist_id) {
@@ -700,10 +722,7 @@ fn create_gist(fragment: &str) -> Result<String, GistError> {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(GistError::Missing),
         Err(e) => Err(GistError::Failed(format!("could not run gh: {e}"))),
-    };
-
-    let _ = std::fs::remove_file(&path);
-    result
+    }
 }
 
 /// Parse a trailing `https://gist.github.com/<user>/<id>` line into `<id>`.
