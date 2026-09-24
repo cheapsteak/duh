@@ -895,7 +895,8 @@ fn run_inner(
     // Install the SIGINT handler (graceful stop → drain + finalize).
     INTERRUPTED.store(false, Ordering::SeqCst);
     unsafe {
-        libc::signal(libc::SIGINT, handle_sigint as libc::sighandler_t);
+        // Via a pointer: newer rustc warns on a direct fn-item-to-integer cast.
+        libc::signal(libc::SIGINT, handle_sigint as *const () as libc::sighandler_t);
     }
 
     // Insert the root dir on this setup thread, before the connection moves to the

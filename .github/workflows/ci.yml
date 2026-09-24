@@ -98,5 +98,28 @@ jobs:
             /usr/bin/time -v ./target/release/duh --db "$db" scan -q "$tree" 2>&1 \
               | grep -E 'Elapsed|Maximum resident|^warning|error' || true
             ls -l "$db"
-            ./target/release/duh --db "$db" stats | head -20
+            /usr/bin/time -f 'freeable compute: wall=%es maxrss=%MKB' \
+              ./target/release/duh --db "$db" freeable "$tree"
+            ./target/release/duh --db "$db" stats > /tmp/stats.txt
+            head -20 /tmp/stats.txt
           done
+
+      # The target workload: two checkouts whose .venv is hardlinked into the uv
+      # cache (uv's default on Linux). Deleting one checkout frees only what is
+      # not held by the cache; excluded vs included .venv shows the difference.
+      - name: uv hardlink scenario
+        run: |
+          set -x
+          python3 -m pip install -q uv
+          mkdir -p /tmp/work && cd /tmp/work
+          for p in a b; do
+            mkdir "$p" && (cd "$p" && uv venv -q && uv pip install -q --link-mode hardlink numpy pandas)
+            head -c 3145728 /dev/urandom > "$p/own.bin"
+          done
+          du -sh ~/.cache/uv /tmp/work/a
+          duh=$GITHUB_WORKSPACE/target/release/duh
+          $duh --db /tmp/uv-default.db scan /tmp/work
+          $duh --db /tmp/uv-default.db freeable /tmp/work/a
+          $duh --db /tmp/uv-incl.db scan -q --include .venv /tmp/work
+          $duh --db /tmp/uv-incl.db freeable /tmp/work/a
+          ls -l /tmp/uv-default.db /tmp/uv-incl.db
