@@ -2,7 +2,8 @@
 
 `du` sums per-file sizes. On APFS, clones make that a lie: a directory can
 "contain" 20 GB and free 3 MB when you delete it. `duh` is a macOS disk usage
-analyzer that reports what deleting actually frees.
+analyzer that reports what deleting actually frees. It also runs on Linux,
+where it handles hardlink families (see [Linux](#linux)).
 
 ## The problem
 
@@ -82,14 +83,16 @@ The `xattr` step is needed because the binary isn't code-signed or notarized
 `PATH` (e.g. `mv duh /usr/local/bin/`) to run it as just `duh`.
 
 **Or build from source** — needs the [Rust toolchain](https://rustup.rs)
-(`brew install rust`):
+(`brew install rust` on macOS; rustup plus a C compiler such as
+`build-essential` on Linux, for the bundled SQLite):
 
 ```sh
 git clone https://github.com/cheapsteak/duh && cd duh
 cargo install --path .        # or: cargo build --release → ./target/release/duh
 ```
 
-Requires macOS on APFS. The **Share** feature additionally needs the `gh` CLI
+Linux has no prebuilt binary yet: build from source as above. Requires macOS
+on APFS, or Linux (x86_64 / aarch64, glibc). The **Share** feature additionally needs the `gh` CLI
 signed in (`gh auth login`).
 
 ## Quickstart
@@ -135,13 +138,42 @@ the database in `sqlite3` with convenience views).
 
 ## Requirements
 
-- macOS on APFS (the tool exits immediately on other platforms; clone
-  detection is APFS-specific).
+- macOS on APFS, or Linux (x86_64 or aarch64, glibc). Clone detection is
+  APFS-specific; on Linux duh detects hardlinks only (see [Linux](#linux)).
+  Other platforms are not supported (the build fails with a compile error).
 - The `duh` binary. Build it with `cargo install --path .` (or
   `cargo build --release` and run `./target/release/duh`) — a Rust toolchain
   is needed only to build, not to run. Python is **not** required to use duh.
 - No network access needed. The `serve` treemap UI ships embedded in the
   binary and runs fully offline.
+
+## Linux
+
+duh builds and runs on Linux, answering `freeable` for **hardlink** families:
+files sharing a `(dev, inode)`, which is how uv and pnpm link `.venv` and
+`node_modules` into their caches on ext4. A family with a link outside the
+directory you ask about (for example, still held by the uv cache or the pnpm
+store) credits nothing to that directory, exactly as on macOS.
+
+What differs from macOS:
+
+- **No reflink detection.** btrfs/XFS reflinks (`cp --reflink`, `FICLONE`)
+  share extents but have no clone id; FIEMAP can only say an extent is
+  "shared", not with which file. duh counts every reflinked file as fully
+  owned, so **`freeable` is overstated for reflinked files.** On ext4 there
+  are no reflinks, so this does not arise. `duh selftest` checks hardlink
+  detection only, and `duh clones` is always empty.
+- **Excluded directories hide hardlinks.** The default exclusion list includes
+  `.venv` and `node_modules`. An excluded directory is stored as one
+  aggregate, so its hardlinks cannot join a family and are counted as owned.
+  When that happens the scan prints a warning with the amount. For exact
+  numbers on a machine with uv/pnpm-linked trees, scan with
+  `--include .venv --include node_modules` (or `--no-default-excludes`); this
+  indexes those trees file by file, so the scan and the database are larger.
+- **`duh serve` on a headless box** (no `DISPLAY` / `WAYLAND_DISPLAY`) prints
+  the URL instead of opening a browser. It binds `127.0.0.1` only, so reach it
+  with `ssh -L 7777:127.0.0.1:7777 <host>`. With a display it uses `xdg-open`.
+- `duh sql` needs the `sqlite3` CLI (`apt install sqlite3`).
 
 ## Gotchas
 

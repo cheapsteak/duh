@@ -1,4 +1,4 @@
-from conftest import run_duh
+from conftest import macos_only, run_duh
 
 
 def test_top_lists_biggest_dirs(scanned):
@@ -6,6 +6,7 @@ def test_top_lists_biggest_dirs(scanned):
     assert "clones" in out and "siblings" in out
 
 
+@macos_only  # `duh clones` ranks clone-id families; Linux has none
 def test_clones_lists_family(scanned):
     out = run_duh("clones", db=scanned.db).stdout
     assert "big.bin" in out or "a.bin" in out
