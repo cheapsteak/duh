@@ -1,7 +1,7 @@
 import os
 import sqlite3
 
-from conftest import EXPECT, MiB, approx, node_id_for, run_duh
+from conftest import EXPECT, MiB, approx, macos_only, node_id_for, run_duh
 
 
 def _con(scanned):
@@ -19,6 +19,7 @@ def test_scan_completes_and_records_metadata(scanned):
     assert scan["files_count"] > 0
 
 
+@macos_only
 def test_clone_family_shares_clone_id(scanned):
     con = _con(scanned)
     cids = {}

@@ -15,7 +15,10 @@ import urllib.request
 
 import pytest
 
-from conftest import DUH_BIN
+from conftest import DUH_BIN, IS_MACOS
+
+# The browser opener `duh serve` invokes: `open` on macOS, `xdg-open` on Linux.
+OPENER = "open" if IS_MACOS else "xdg-open"
 
 rust_only = pytest.mark.skipif(
     "target" not in str(DUH_BIN),
@@ -124,21 +127,24 @@ def test_file_children_freeable_semantics(server):
     assert data_bin["total_blocks"] > 0
 
 
-def _serve_with_open_stub(scanned, tmp_path, *extra_args):
-    """Start `duh serve` with a stub `open` shadowing the real one on PATH
-    (so no actual browser is ever launched) and return (proc, port, log)."""
+def _serve_with_open_stub(scanned, tmp_path, *extra_args, display=True):
+    """Start `duh serve` with a stub opener (`open` / `xdg-open`) shadowing the
+    real one on PATH (so no actual browser is ever launched) and return
+    (proc, port, log). On Linux `display` controls whether DISPLAY is set."""
     stub_dir = tmp_path / "bin"
     stub_dir.mkdir()
     log = tmp_path / "open.log"
-    stub = stub_dir / "open"
+    stub = stub_dir / OPENER
     stub.write_text(f'#!/bin/sh\necho "$@" >> {log}\n')
     stub.chmod(0o755)
     port = _free_port()
+    env = {"DUH_DB": str(scanned.db), "PATH": f"{stub_dir}:/usr/bin:/bin",
+           "HOME": "/tmp"}
+    if display and not IS_MACOS:
+        env["DISPLAY"] = ":0"
     proc = subprocess.Popen(
         [str(DUH_BIN), "serve", "--port", str(port), *extra_args],
-        env={"DUH_DB": str(scanned.db), "PATH": f"{stub_dir}:/usr/bin:/bin",
-             "HOME": "/tmp"},
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     return proc, port, log
 
 
@@ -150,10 +156,28 @@ def test_serve_auto_opens_browser(scanned, tmp_path):
         deadline = time.time() + 10
         while time.time() < deadline and not log.exists():
             time.sleep(0.1)
-        assert log.exists(), "`open` was never invoked"
+        assert log.exists(), f"`{OPENER}` was never invoked"
         assert f"http://127.0.0.1:{port}/" in log.read_text()
     finally:
         proc.terminate(); proc.wait(timeout=10)
+
+
+@rust_only
+@pytest.mark.skipif(IS_MACOS, reason="headless handling is Linux-only")
+def test_headless_linux_prints_url_instead_of_opening(scanned, tmp_path):
+    """No DISPLAY/WAYLAND_DISPLAY (an SSH session on a server): the opener is
+    never invoked, the server still comes up, and stderr carries the URL."""
+    proc, port, log = _serve_with_open_stub(scanned, tmp_path, display=False)
+    try:
+        _wait_port(port)
+        time.sleep(0.5)
+        assert not log.exists(), log.read_text()
+        assert proc.poll() is None, "serve must keep running without a display"
+    finally:
+        proc.terminate()
+        _, err = proc.communicate(timeout=10)
+    assert "no display detected" in err
+    assert f"http://127.0.0.1:{port}/" in err
 
 
 @rust_only

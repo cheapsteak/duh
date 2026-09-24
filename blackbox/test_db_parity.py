@@ -1,7 +1,10 @@
 import subprocess
 
 import db_diff
-from conftest import REPO
+from conftest import REPO, macos_only
+
+# The Python oracle reads APFS clone ids through getattrlist: macOS only.
+pytestmark = macos_only
 
 
 def test_rust_scan_matches_python_scan(fixture_tree, tmp_path):

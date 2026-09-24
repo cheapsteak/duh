@@ -722,7 +722,8 @@ pub(crate) fn ctime(secs: i64) -> String {
         if libc::localtime_r(&t, &mut tm).is_null() {
             return String::new();
         }
-        let mut buf = [0i8; 32];
+        // c_char, not i8: it is u8 on aarch64 Linux.
+        let mut buf = [0 as libc::c_char; 32];
         if libc::asctime_r(&tm, buf.as_mut_ptr()).is_null() {
             return String::new();
         }

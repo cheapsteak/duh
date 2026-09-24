@@ -43,3 +43,60 @@ jobs:
 
       - name: parity vs python reference
         run: python3 -m pytest blackbox/test_db_parity.py -q
+
+  # Linux: hardlink families only (no clone/reflink detection). Runs the Rust
+  # tests and the platform-neutral black-box suite; the APFS/hdiutil gold tests
+  # and the Python-oracle parity tests skip themselves off macOS.
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        id: rust-cache
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: cargo test --release
+      - run: cargo build --release
+
+      - name: selftest
+        run: ./target/release/duh selftest
+
+      - name: install pytest
+        run: python3 -m pip install pytest
+
+      - name: black-box suite vs rust
+        run: DUH_BIN=$PWD/target/release/duh python3 -m pytest blackbox/ -q -rs
+
+      # Footprint numbers for deciding whether to install on a box. Informational:
+      # nothing here gates the job.
+      - name: measurements
+        run: |
+          set -x
+          echo "rust-cache hit: ${{ steps.rust-cache.outputs.cache-hit }}"
+          uname -m; nproc; df -hT / | tail -1
+          ls -l target/release/duh
+          cp target/release/duh /tmp/duh-stripped && strip /tmp/duh-stripped
+          ls -l /tmp/duh-stripped
+          # Clean release build in a fresh target dir (the cache only covers target/).
+          /usr/bin/time -f 'clean build: wall=%es maxrss=%MKB' \
+            env CARGO_TARGET_DIR=/tmp/clean-target cargo build --release -q
+          for tree in "$HOME/.cargo" /usr; do
+            db=/tmp/measure-$(basename "$tree").db
+            rm -f "$db"
+            find "$tree" -xdev | wc -l
+            du -sxh "$tree" 2>/dev/null | tail -1
+            /usr/bin/time -v ./target/release/duh --db "$db" scan -q "$tree" 2>&1 \
+              | grep -E 'Elapsed|Maximum resident|^warning|error' || true
+            ls -l "$db"
+            ./target/release/duh --db "$db" stats | head -20
+          done

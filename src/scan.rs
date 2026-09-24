@@ -225,8 +225,18 @@ type Family = (i64, i64, i64);
 /// `--no-clones` flag, so excluded_families are populated even under `--no-clones`
 /// (`reference/duh-py:698` calls it unconditionally). Only regular files carry a clone_id
 /// (EntryAttrs sets it for VREG only, matching `reference/duh-py:463-468`).
-fn walk_for_aggregate(dir_path: &Path, root_dev: i32) -> (i64, i64, i64, HashMap<u64, Family>) {
+///
+/// The fifth element is the allocated bytes of multi-link files (`nlink > 1`,
+/// no clone id) seen inside the subtree. It does not feed the DB: an excluded
+/// subtree is a leaf aggregate, so its hardlinks cannot join a hardlink family
+/// and are counted as fully owned. The scanner only uses it to warn on Linux,
+/// where package managers hardlink `.venv` / `node_modules` into shared stores.
+fn walk_for_aggregate(
+    dir_path: &Path,
+    root_dev: i32,
+) -> (i64, i64, i64, HashMap<u64, Family>, i64) {
     let mut total_blocks: i64 = 0;
+    let mut hardlinked_blocks: i64 = 0;
     let mut total_logical: i64 = 0;
     let mut total_count: i64 = 0;
     let mut families: HashMap<u64, Family> = HashMap::new();
@@ -249,6 +259,9 @@ fn walk_for_aggregate(dir_path: &Path, root_dev: i32) -> (i64, i64, i64, HashMap
             if e.is_dir && !e.is_symlink {
                 stack.push(d.join(&e.name));
             } else if !e.is_symlink {
+                if e.clone_id.is_none() && e.nlink > 1 {
+                    hardlinked_blocks += blk;
+                }
                 if let Some(cid) = e.clone_id {
                     let rec = families.entry(cid).or_insert((0, 0, 0));
                     rec.0 += 1;
@@ -260,7 +273,7 @@ fn walk_for_aggregate(dir_path: &Path, root_dev: i32) -> (i64, i64, i64, HashMap
             }
         }
     }
-    (total_blocks, total_logical, total_count, families)
+    (total_blocks, total_logical, total_count, families, hardlinked_blocks)
 }
 
 /// A leaf (file or symlink) row bound for the writer.
@@ -324,6 +337,9 @@ struct Totals {
     logical: AtomicI64,
     blocks: AtomicI64,
     excluded: AtomicI64,
+    /// Allocated bytes of multi-link files inside excluded subtrees (see
+    /// `walk_for_aggregate`); only reported on Linux.
+    excluded_hardlinked: AtomicI64,
 }
 
 /// Shared work queue + termination bookkeeping for the worker pool.
@@ -511,8 +527,11 @@ fn worker(
 
             // Exclusion check (dirs only), BEFORE clone-id collection (reference/duh-py:694-724).
             if is_dir && !is_symlink && excludes.matches(&name_str, &entry_rel) {
-                let (agg_blocks, agg_logical, agg_count, families) =
+                let (agg_blocks, agg_logical, agg_count, families, agg_hardlinked) =
                     walk_for_aggregate(&entry_path, root_dev);
+                totals
+                    .excluded_hardlinked
+                    .fetch_add(agg_hardlinked, Ordering::Relaxed);
                 let fams: Vec<(u64, i64, i64, i64)> = families
                     .into_iter()
                     .map(|(cid, (cnt, bsum, bmax))| (cid, cnt, bsum, bmax))
@@ -1004,6 +1023,25 @@ fn run_inner(
             fmt_bytes(total_blocks),
             db_path.display()
         );
+    }
+
+    // Linux only (macOS output is unchanged): uv and pnpm hardlink `.venv` /
+    // `node_modules` into their shared stores there, and those names are on the
+    // default exclusion list, so an excluded subtree's hardlinked bytes are
+    // counted as fully owned and `freeable` overstates them.
+    #[cfg(target_os = "linux")]
+    {
+        let hl = totals.excluded_hardlinked.load(Ordering::Relaxed);
+        if hl > 0 {
+            eprintln!(
+                "warning: excluded directories contain {} of hardlinked files. Excluded\n\
+                 \x20 subtrees are aggregated, so their hardlinks count as fully owned and\n\
+                 \x20 `freeable` overstates them. For exact hardlink accounting, rescan with\n\
+                 \x20 --include NAME for those directories (e.g. --include .venv\n\
+                 \x20 --include node_modules) or --no-default-excludes; `duh excluded` lists them.",
+                fmt_bytes(hl)
+            );
+        }
     }
 
     Ok(ExitCode::SUCCESS)

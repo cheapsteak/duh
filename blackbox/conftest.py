@@ -4,6 +4,7 @@ import pathlib
 import shutil
 import sqlite3
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 
@@ -12,6 +13,11 @@ import pytest
 MiB = 1 << 20
 REPO = pathlib.Path(__file__).resolve().parent.parent
 DUH_BIN = pathlib.Path(os.environ.get("DUH_BIN", REPO / "target/release/duh"))
+
+IS_MACOS = sys.platform == "darwin"
+# APFS clone ids (and the Python oracle, which reads them via getattrlist) exist
+# only on macOS. On Linux duh detects hardlink families only.
+macos_only = pytest.mark.skipif(not IS_MACOS, reason="APFS clone ids: macOS only")
 
 
 def run_duh(*argv, db, check=True, timeout=300):
@@ -25,6 +31,8 @@ def run_duh(*argv, db, check=True, timeout=300):
 @pytest.fixture(scope="session")
 def apfs_volume(tmp_path_factory):
     """Dedicated APFS volume: hermetic df numbers, safe rm -rf."""
+    if not IS_MACOS:
+        pytest.skip("hdiutil APFS volume: macOS only")
     img = tmp_path_factory.mktemp("img") / "duhtest.sparseimage"
     subprocess.run(
         ["hdiutil", "create", "-size", "512m", "-fs", "APFS",
@@ -41,6 +49,25 @@ def apfs_volume(tmp_path_factory):
     subprocess.run(["hdiutil", "detach", mount, "-force"], check=False)
 
 
+@pytest.fixture(scope="session")
+def scan_volume(request, tmp_path_factory):
+    """Where the shared fixture tree lives: the private APFS volume on macOS,
+    a plain temp dir (ext4 on CI runners) elsewhere."""
+    if IS_MACOS:
+        return request.getfixturevalue("apfs_volume")
+    return tmp_path_factory.mktemp("vol")
+
+
+def share_blocks(src, dst):
+    """Make `dst` share `src`'s blocks: an APFS clone (`cp -c`) on macOS, a
+    hardlink elsewhere. Either way the pair is one family whose blocks free
+    only when every member is deleted, so the freeable expectations hold."""
+    if IS_MACOS:
+        subprocess.run(["cp", "-c", src, dst], check=True)
+    else:
+        os.link(src, dst)
+
+
 def _rand(p: pathlib.Path, mib: int):
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_bytes(os.urandom(mib * MiB))
@@ -49,16 +76,16 @@ def _rand(p: pathlib.Path, mib: int):
 def build_tree(root: pathlib.Path):
     """Known layout exercising every semantic: clone family with LCA above a
     dir (freeable=0), sibling-spanning family (locked_here/cluster),
-    hardlinks, unique data, sparse file, default-excluded dir."""
+    hardlinks, unique data, sparse file, default-excluded dir.
+
+    Off macOS the "clone" families are hardlinks (see `share_blocks`)."""
     _rand(root / "big.bin", 8)
     (root / "clones").mkdir()
-    subprocess.run(["cp", "-c", root / "big.bin", root / "clones/a.bin"], check=True)
-    subprocess.run(["cp", "-c", root / "big.bin", root / "clones/b.bin"], check=True)
+    share_blocks(root / "big.bin", root / "clones/a.bin")
+    share_blocks(root / "big.bin", root / "clones/b.bin")
     _rand(root / "siblings/x/data.bin", 4)
     (root / "siblings/y").mkdir(parents=True)
-    subprocess.run(
-        ["cp", "-c", root / "siblings/x/data.bin", root / "siblings/y/data.bin"],
-        check=True)
+    share_blocks(root / "siblings/x/data.bin", root / "siblings/y/data.bin")
     _rand(root / "hardlinks/h1", 2)
     os.link(root / "hardlinks/h1", root / "hardlinks/h2")
     _rand(root / "unique/u.bin", 2)
@@ -88,8 +115,8 @@ class Scanned:
 
 
 @pytest.fixture(scope="session")
-def fixture_tree(apfs_volume):
-    root = apfs_volume / "tree"
+def fixture_tree(scan_volume):
+    root = scan_volume / "tree"
     root.mkdir()
     build_tree(root)
     return root

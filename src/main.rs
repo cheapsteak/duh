@@ -1,5 +1,5 @@
-#[cfg(not(target_os = "macos"))]
-compile_error!("duh is macOS-only");
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+compile_error!("duh supports macOS and Linux only");
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 /// macOS APFS-aware disk-usage database (v2). Detects clones and hardlinks.
 #[derive(Parser)]
 #[command(name = "duh", version)]
+#[cfg_attr(target_os = "linux", command(about = LINUX_ABOUT, long_about = LINUX_LONG_ABOUT))]
 struct Cli {
     /// Override DB path (or set DUH_DB env var)
     #[arg(long, global = true, value_name = "PATH")]
@@ -21,6 +22,10 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Verify APFS clone detection (ctypes getattrlist test)
+    #[cfg_attr(
+        target_os = "linux",
+        command(about = "Verify hardlink detection (no clone/reflink detection on Linux)")
+    )]
     Selftest,
 
     /// Walk a directory and index files
@@ -133,6 +138,20 @@ enum Command {
     },
 }
 
+/// `--help` summary on Linux, where only hardlink families are detected.
+#[cfg(target_os = "linux")]
+const LINUX_ABOUT: &str = "Disk-usage database (v2) that reports what deleting actually frees. \
+Detects hardlinks; on Linux it does NOT detect reflinks (btrfs/XFS clones).";
+
+#[cfg(target_os = "linux")]
+const LINUX_LONG_ABOUT: &str = "Disk-usage database (v2) that reports what deleting actually frees. \
+Detects hardlinks; on Linux it does NOT detect reflinks (btrfs/XFS clones).
+
+Hardlink families are found by (dev, inode) and credited once, at the lowest common \
+ancestor of their members; a family with a link outside the queried directory credits \
+nothing to it. Reflinked files (cp --reflink, FICLONE) carry no clone id on Linux, so \
+duh counts each one as fully owned and overstates freeable for them.";
+
 /// Resolve the DB path: `--db` flag > `DUH_DB` env var > `~/.local/share/duh/scan.db`.
 fn resolve_db_path(db_flag: Option<PathBuf>) -> PathBuf {
     db_flag.unwrap_or_else(duh::db::default_db_path)
@@ -217,6 +236,7 @@ where
     }
 }
 
+#[cfg(target_os = "macos")]
 /// Port of the Python oracle's `cmd_selftest` (`reference/duh-py:121-169`): create a 1 MiB
 /// random file under `~/tmp-duh-selftest/run-<millis>`, `cp -c` clone it, byte-copy
 /// it, then confirm the clone shares the source's clone_id while the copy does not.
@@ -299,6 +319,83 @@ fn run_selftest() -> ExitCode {
     })();
 
     // Cleanup (best-effort), mirroring the Python `finally` block.
+    let _ = std::fs::remove_dir_all(&tmpdir);
+    let _ = std::fs::remove_dir(&home_tmp);
+
+    result.unwrap_or_else(|e| {
+        eprintln!("  error: {e}");
+        ExitCode::from(1)
+    })
+}
+
+/// Linux self-test: there is no clone id to verify, so check the hardlink
+/// plumbing end to end instead. Create a file, a hardlink to it, and a plain
+/// copy in a temp dir, read them back through the scanner's own directory
+/// reader, and confirm the link pair shares `(dev, ino)` with `nlink == 2`
+/// while the copy does not.
+#[cfg(target_os = "linux")]
+fn run_selftest() -> ExitCode {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    println!("Running hardlink-detection self-test...");
+    println!("  note: clone/reflink detection is not available on Linux; reflinked");
+    println!("        files are counted as fully owned (freeable is overstated for them)");
+
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let home_tmp = home.join("tmp-duh-selftest");
+    if let Err(e) = std::fs::create_dir_all(&home_tmp) {
+        eprintln!("  error: could not create {}: {e}", home_tmp.display());
+        return ExitCode::from(1);
+    }
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let tmpdir = home_tmp.join(format!("run-{millis}"));
+    if let Err(e) = std::fs::create_dir(&tmpdir) {
+        eprintln!("  error: could not create {}: {e}", tmpdir.display());
+        return ExitCode::from(1);
+    }
+
+    let result = (|| -> std::io::Result<ExitCode> {
+        let mut urandom = std::fs::File::open("/dev/urandom")?;
+        let mut buf = vec![0u8; 1 << 20];
+        std::io::Read::read_exact(&mut urandom, &mut buf)?;
+        std::fs::write(tmpdir.join("src"), &buf)?;
+        std::fs::hard_link(tmpdir.join("src"), tmpdir.join("link"))?;
+        std::fs::write(tmpdir.join("copy"), &buf)?;
+
+        let entries = duh::attrs::read_dir_attrs(&tmpdir)?;
+        let find = |name: &str| entries.iter().find(|e| e.name == name);
+        let (Some(src), Some(link), Some(copy)) = (find("src"), find("link"), find("copy")) else {
+            println!("  FAIL: directory reader did not return all three test files");
+            return Ok(ExitCode::from(1));
+        };
+
+        for (label, e) in [("src ", src), ("link", link), ("copy", copy)] {
+            println!(
+                "  {label}  dev={} ino={} nlink={} blocks={}",
+                e.dev, e.ino, e.nlink, e.size_blocks
+            );
+        }
+
+        let ok_link =
+            src.dev == link.dev && src.ino == link.ino && src.nlink == 2 && link.nlink == 2;
+        let ok_copy = (copy.dev, copy.ino) != (src.dev, src.ino) && copy.nlink == 1;
+
+        if ok_link && ok_copy {
+            println!("  PASS: src and link share (dev, ino) with nlink=2; copy is independent");
+            Ok(ExitCode::SUCCESS)
+        } else if !ok_link {
+            println!("  FAIL: src and link do NOT share (dev, ino) with nlink=2");
+            Ok(ExitCode::from(1))
+        } else {
+            println!("  FAIL: copy shares the source's inode or has nlink != 1");
+            Ok(ExitCode::from(1))
+        }
+    })();
+
+    // Cleanup (best-effort), mirroring the macOS self-test.
     let _ = std::fs::remove_dir_all(&tmpdir);
     let _ = std::fs::remove_dir(&home_tmp);
 

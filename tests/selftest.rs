@@ -1,3 +1,6 @@
+// APFS clone ids via `cp -c`: macOS only. Linux coverage is tests/attrs_hardlinks.rs.
+#![cfg(target_os = "macos")]
+
 use std::process::Command;
 
 fn sh(cmd: &str) {

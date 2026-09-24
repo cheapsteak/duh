@@ -171,8 +171,26 @@ pub fn run(db_path: &Path, port: u16, no_browser: bool) -> ExitCode {
                 .stderr(std::process::Stdio::null())
                 .spawn()
         };
+        #[cfg(target_os = "macos")]
         if let Err(e) = spawn("open").or_else(|_| spawn("/usr/bin/open")) {
             eprintln!("[serve] could not open browser: {e}");
+        }
+        // Linux: `xdg-open`, but only when there is a display to open it on. A
+        // headless box (SSH session, EC2) just gets the URL; nothing here can
+        // fail the command.
+        #[cfg(target_os = "linux")]
+        {
+            let has_display = ["DISPLAY", "WAYLAND_DISPLAY"]
+                .iter()
+                .any(|v| std::env::var_os(v).is_some_and(|s| !s.is_empty()));
+            if !has_display {
+                eprintln!(
+                    "[serve] no display detected; open {url} in a browser \
+                     (over SSH: ssh -L {bound_port}:127.0.0.1:{bound_port} <host>)"
+                );
+            } else if let Err(e) = spawn("xdg-open").or_else(|_| spawn("/usr/bin/xdg-open")) {
+                eprintln!("[serve] could not open browser: {e}; open {url} manually");
+            }
         }
     }
 
